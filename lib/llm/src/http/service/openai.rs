@@ -625,6 +625,7 @@ where
         .map_err(|err| ErrorMessage::request_headers_too_large(&err.to_string()))?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
     attach_x_request_id(&mut request, headers);
+    super::pylon_stats::attach_request_identity(&mut request, headers);
     if let Some(mut agent_context) = agent_context_from_headers(headers) {
         agent_context.input_trigger = classify_input_trigger(request.content());
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);
@@ -844,9 +845,7 @@ async fn completions_single(
             err_response
         })?;
 
-    let mut response_collector = state
-        .metrics_clone()
-        .create_response_collector(&metric_model);
+    let mut response_collector = state.create_response_collector(&metric_model, &request);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -1112,9 +1111,7 @@ async fn completions_batch(
             err_response
         })?;
 
-    let mut response_collector = state
-        .metrics_clone()
-        .create_response_collector(&metric_model);
+    let mut response_collector = state.create_response_collector(&metric_model, &request);
 
     // prepare to process any annotations
     let annotations = request.annotations();
@@ -2649,9 +2646,7 @@ async fn chat_completions(
             request.chat_template_args.as_ref(),
         );
 
-    let mut response_collector = state
-        .metrics_clone()
-        .create_response_collector(&metric_model);
+    let mut response_collector = state.create_response_collector(&metric_model, &request);
 
     let annotations = request.annotations();
 
@@ -3233,9 +3228,7 @@ async fn responses(
     // rather than on this flag — but the aggregator backstop should be wired here
     // too at that point. Tracked as follow-up.
 
-    let mut response_collector = state
-        .metrics_clone()
-        .create_response_collector(&metric_model);
+    let mut response_collector = state.create_response_collector(&metric_model, &request);
 
     tracing::trace!("Issuing generate call for responses");
 

@@ -58,7 +58,6 @@ pub struct DistributedRuntime {
     network_manager: Arc<NetworkManager>,
     tcp_server: Arc<OnceCell<Arc<transports::tcp::server::TcpStreamServer>>>,
     system_status_server: Arc<OnceLock<Arc<system_status_server::SystemStatusServerInfo>>>,
-    pylon_stats: crate::pylon_stats::PylonStats,
     request_plane: RequestPlaneMode,
 
     // Service discovery client
@@ -207,7 +206,6 @@ impl DistributedRuntime {
             nats_client,
             tcp_server: Arc::new(OnceCell::new()),
             system_status_server: Arc::new(OnceLock::new()),
-            pylon_stats: crate::pylon_stats::PylonStats::default(),
             discovery_client,
             discovery_metadata,
             component_registry,
@@ -436,11 +434,6 @@ impl DistributedRuntime {
         &self,
     ) -> Option<Arc<crate::system_status_server::SystemStatusServerInfo>> {
         self.system_status_server.get().cloned()
-    }
-
-    /// Runtime-owned publisher and latest KV observations for Pylon routes.
-    pub fn pylon_stats(&self) -> &crate::pylon_stats::PylonStats {
-        &self.pylon_stats
     }
 
     /// How the frontend should talk to the backend.

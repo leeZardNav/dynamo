@@ -101,6 +101,7 @@ async fn track_inflight_inference(
 /// HTTP service shared state
 pub struct State {
     metrics: Arc<Metrics>,
+    pylon_stats: super::pylon_stats::PylonStats,
     manager: Arc<ModelManager>,
     discovery_client: Arc<dyn Discovery>,
     service_observer: Arc<ServiceObserver>,
@@ -433,6 +434,7 @@ impl State {
         Self {
             manager,
             metrics: Arc::new(Metrics::new_with_prefix(config.metrics_config.prefix())),
+            pylon_stats: super::pylon_stats::PylonStats::default(),
             discovery_client,
             service_observer: Arc::new(ServiceObserver::default()),
             nvext_enabled: config.nvext_enabled,
@@ -460,6 +462,22 @@ impl State {
     /// Get the Prometheus [`Metrics`] object which tracks request counts and inflight requests
     pub fn metrics_clone(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+
+    pub(super) fn pylon_stats(&self) -> &super::pylon_stats::PylonStats {
+        &self.pylon_stats
+    }
+
+    pub(super) fn create_response_collector<T: Send + Sync + 'static>(
+        &self,
+        model: &str,
+        request: &dynamo_runtime::pipeline::Context<T>,
+    ) -> metrics::ResponseMetricCollector {
+        let mut collector = self.metrics_clone().create_response_collector(model);
+        if let Some(identity) = super::pylon_stats::request_identity(request) {
+            collector.attach_pylon_request(self.pylon_stats.clone(), identity);
+        }
+        collector
     }
 
     pub fn manager(&self) -> &ModelManager {
@@ -1210,6 +1228,7 @@ impl HttpServiceConfigBuilder {
                 var(HTTP_SVC_METRICS_PATH_ENV).ok(),
                 config.drt_metrics,
             ),
+            super::pylon_stats::router(state.clone()),
             if anthropic_endpoints_enabled {
                 super::anthropic::anthropic_models_router(
                     state.clone(),

@@ -13,25 +13,21 @@ use crate::metrics::MetricsHierarchy;
 use crate::traits::DistributedRuntimeProvider;
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::Bytes,
     extract::{Json, Path, State},
-    http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{any, delete, get, post},
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
-
-const PYLON_STATS_PING_INTERVAL: Duration = Duration::from_secs(15);
-const PYLON_STATS_PING_LINE: &[u8] = b"{\"v\":1,\"type\":\"ping\"}\n";
 
 /// System status server information containing socket address and handle
 #[derive(Debug)]
@@ -159,7 +155,6 @@ pub async fn spawn_system_status_server(
     let lora_enabled =
         crate::config::env_is_truthy(crate::config::environment_names::llm::DYN_LORA_ENABLED);
 
-    let pylon_shutdown = cancel_token.clone();
     let mut app = Router::new()
         .route(
             &health_path,
@@ -187,21 +182,6 @@ pub async fn spawn_system_status_server(
             get({
                 let state = Arc::clone(&server_state);
                 move || metadata_handler(state)
-            }),
-        )
-        .route(
-            "/pylon/v1/stats/stream",
-            get({
-                let stats = server_state.drt().pylon_stats().clone();
-                let shutdown = pylon_shutdown.clone();
-                move || pylon_stats_stream_handler(stats.clone(), shutdown.clone())
-            }),
-        )
-        .route(
-            "/kv-cache/stats",
-            get({
-                let stats = server_state.drt().pylon_stats().clone();
-                move || kv_cache_stats_handler(stats.clone())
             }),
         )
         .route(
@@ -286,79 +266,6 @@ pub async fn spawn_system_status_server(
     });
 
     Ok((actual_address, handle))
-}
-
-/// Pylon's live request-counter stream.
-async fn pylon_stats_stream_handler(
-    stats: crate::pylon_stats::PylonStats,
-    shutdown: CancellationToken,
-) -> Response {
-    if !stats.request_stats_producer_available() {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": "pylon_stats_not_supported",
-                "message": "no Pylon stats producer is attached to this worker",
-            })),
-        )
-            .into_response();
-    }
-
-    let mut receiver = stats.subscribe_request_stats();
-    let stream = async_stream::stream! {
-        let mut ping = tokio::time::interval_at(
-            tokio::time::Instant::now() + PYLON_STATS_PING_INTERVAL,
-            PYLON_STATS_PING_INTERVAL,
-        );
-        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Establish a valid NDJSON stream immediately, even while idle.
-        yield Ok::<Bytes, Infallible>(Bytes::from_static(PYLON_STATS_PING_LINE));
-
-        loop {
-            tokio::select! {
-                event = receiver.recv() => match event {
-                    Ok(line) => yield Ok(line),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
-                        tracing::debug!(dropped, "Pylon stats stream subscriber lagged; old events dropped");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                },
-                _ = ping.tick() => {
-                    yield Ok(Bytes::from_static(PYLON_STATS_PING_LINE));
-                }
-                _ = shutdown.cancelled() => break,
-            }
-        }
-    };
-
-    let mut response = Response::new(Body::from_stream(stream));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/x-ndjson"),
-    );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    response
-}
-
-async fn kv_cache_stats_handler(stats: crate::pylon_stats::PylonStats) -> Response {
-    let mut response = match stats.kv_cache_stats() {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": error.response_code(),
-                "message": error.to_string(),
-            })),
-        )
-            .into_response(),
-    };
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
 }
 
 /// Health handler with optional active health checking
@@ -803,146 +710,7 @@ async fn engine_route_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
     use tokio::time::Duration;
-
-    #[tokio::test]
-    async fn pylon_stats_stream_route_rejects_unsupported_backends() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        let response = pylon_stats_stream_handler(stats, CancellationToken::new()).await;
-
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"], "pylon_stats_not_supported");
-    }
-
-    #[tokio::test]
-    async fn pylon_stats_stream_route_emits_ndjson_ping_and_stats_event() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        stats.mark_request_stats_producer_available();
-        let response = pylon_stats_stream_handler(stats.clone(), CancellationToken::new()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "application/x-ndjson"
-        );
-
-        let mut body = response.into_body().into_data_stream();
-        assert_eq!(
-            body.next().await.unwrap().unwrap(),
-            Bytes::from_static(PYLON_STATS_PING_LINE)
-        );
-
-        stats
-            .publish_request_stats(crate::pylon_stats::RequestStatsUpdate {
-                request_id: "req-123",
-                model: "llama",
-                tokens_processed: Some(128),
-                tokens_generated: Some(17),
-                finished: false,
-            })
-            .unwrap();
-        let line = body.next().await.unwrap().unwrap();
-        let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
-        assert_eq!(event["v"], 1);
-        assert_eq!(event["type"], "stats");
-        assert_eq!(event["request_id"], "req-123");
-        assert_eq!(event["model"], "llama");
-        assert_eq!(event["tokens_processed"], 128);
-        assert_eq!(event["tokens_generated"], 17);
-        assert_eq!(event["finished"], false);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pylon_stats_stream_route_emits_periodic_idle_ping() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        stats.mark_request_stats_producer_available();
-        let response = pylon_stats_stream_handler(stats.clone(), CancellationToken::new()).await;
-        let mut body = response.into_body().into_data_stream();
-        let first = body.next().await.unwrap().unwrap();
-        assert_eq!(first, Bytes::from_static(PYLON_STATS_PING_LINE));
-
-        let second = tokio::time::timeout(Duration::from_secs(16), body.next())
-            .await
-            .expect("periodic ping should arrive")
-            .unwrap()
-            .unwrap();
-        assert_eq!(second, Bytes::from_static(PYLON_STATS_PING_LINE));
-    }
-
-    #[tokio::test]
-    async fn pylon_stats_stream_route_closes_on_runtime_cancellation() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        stats.mark_request_stats_producer_available();
-        let shutdown = CancellationToken::new();
-        let response = pylon_stats_stream_handler(stats, shutdown.clone()).await;
-        let mut body = response.into_body().into_data_stream();
-        assert_eq!(
-            body.next().await.unwrap().unwrap(),
-            Bytes::from_static(PYLON_STATS_PING_LINE)
-        );
-
-        shutdown.cancel();
-        assert!(body.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn kv_cache_stats_route_fails_closed_until_all_ranks_are_observed() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        let response = kv_cache_stats_handler(stats.clone()).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"], "kv_cache_stats_not_ready");
-
-        stats.configure_kv_cache("model-a", 2, 16).unwrap();
-        stats
-            .update_kv_snapshot(crate::pylon_stats::KvCacheSnapshot {
-                dp_rank: 0,
-                used_blocks: 4,
-                total_blocks: 10,
-            })
-            .unwrap();
-        let response = kv_cache_stats_handler(stats).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(error["message"].as_str().unwrap().contains("1 of 2"));
-    }
-
-    #[tokio::test]
-    async fn kv_cache_stats_route_returns_aggregated_token_counts() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        stats.configure_kv_cache("served-model", 2, 16).unwrap();
-        for (rank, used, total) in [(0, 4, 10), (1, 6, 20)] {
-            stats
-                .update_kv_snapshot(crate::pylon_stats::KvCacheSnapshot {
-                    dp_rank: rank,
-                    used_blocks: used,
-                    total_blocks: total,
-                })
-                .unwrap();
-        }
-
-        let response = kv_cache_stats_handler(stats).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            snapshot,
-            serde_json::json!({
-                "model": "served-model",
-                "kv_cache_capacity_tokens": 480,
-                "kv_cache_used_tokens": 160,
-                "kv_cache_free_tokens": 320,
-            })
-        );
-    }
 
     // This is a basic test to verify the HTTP server is working before testing other more complicated tests
     #[tokio::test]

@@ -37,7 +37,6 @@ from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.backend.engine import is_generation_stage
 from dynamo.common.constants import DisaggregationMode as CommonDisaggregationMode
 from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
-from dynamo.common.pylon_stats import PylonRequestStats
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.health_check import HEALTH_CHECK_KEY
 from dynamo.llm.exceptions import EngineShutdown
@@ -70,8 +69,6 @@ from dynamo.trtllm.utils.request_utils import (
 )
 
 if TYPE_CHECKING:
-    from dynamo._core import PylonStatsPublisher
-
     # tensorrt_llm may use a different version that doesn't have MetricsCollector,
     # so guard this import inside TYPE_CHECKING to avoid runtime import errors.
     from tensorrt_llm.metrics import MetricsCollector
@@ -185,7 +182,8 @@ class _Abortable(Protocol):
     """Structural type for objects that support abort(). Satisfied by both
     GenerationResult and _DeferredAbort."""
 
-    def abort(self) -> None: ...
+    def abort(self) -> None:
+        ...
 
 
 class _DeferredAbort:
@@ -238,13 +236,13 @@ class RequestHandlerConfig:
     publisher: Optional[Publisher]
     disaggregation_mode: DisaggregationMode
     encode_client: Optional[Client] = None
-    multimodal_processor: Optional[MultimodalRequestProcessor] = (
-        None  # for multimodal support
-    )
+    multimodal_processor: Optional[
+        MultimodalRequestProcessor
+    ] = None  # for multimodal support
     connector: Optional[Connector] = None
-    runtime: Optional[DistributedRuntime] = (
-        None  # DistributedRuntime reference for graceful shutdown
-    )
+    runtime: Optional[
+        DistributedRuntime
+    ] = None  # DistributedRuntime reference for graceful shutdown
     metrics_collector: Optional["MetricsCollector"] = None
     kv_block_size: int = 32
     shutdown_event: Optional[asyncio.Event] = None
@@ -257,7 +255,6 @@ class RequestHandlerConfig:
     conversation_affinity: bool = False
     # Select whether the engine or Dynamo owns initial DP-rank placement in affinity mode.
     conversation_affinity_dp_rank_source: str = "engine"
-    pylon_stats_publisher: Optional["PylonStatsPublisher"] = None
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -308,7 +305,6 @@ class HandlerBase(BaseGenerativeHandler):
         self._no_inflight_requests.set()
         self._pause_controller = TRTLLMEnginePauseController(config.engine)
         self._reject_new_requests = False
-        self._pylon_stats_publisher = config.pylon_stats_publisher
 
     def check_error(self, result: dict) -> bool:
         """
@@ -1223,16 +1219,6 @@ class HandlerBase(BaseGenerativeHandler):
         # Priority is a float in [0.0, 1.0]; health checks use 1.0. Default is 0.5.
         priority = request.get("priority", DEFAULT_REQUEST_PRIORITY)
         cache_salt = request_cache_salt(request)
-        pylon_publisher = self._pylon_stats_publisher
-        request_stats = (
-            PylonRequestStats(
-                pylon_publisher,
-                context.id(),
-            )
-            if pylon_publisher is not None
-            else None
-        )
-        prompt_stats_recorded = False
 
         try:
             # NEW: Updated engine call to include multimodal data
@@ -1283,16 +1269,10 @@ class HandlerBase(BaseGenerativeHandler):
                         yield {"finish_reason": "error", "token_ids": []}
                         break
 
-                    if request_stats is not None and not prompt_stats_recorded:
-                        request_stats.mark_prompt_processed(
-                            len(request.get("token_ids", []))
-                        )
-                        prompt_stats_recorded = True
-
                     for output in res.outputs:
                         output_idx = getattr(output, "index", 0) or 0
                         tokens_so_far = output_tokens_per_choice.get(output_idx, 0)
-                        next_total_toks = max(tokens_so_far, len(output.token_ids))
+                        next_total_toks = len(output.token_ids)
 
                         # The engine returns all tokens generated so far for
                         # this choice. Calculate only the new tokens generated
@@ -1382,8 +1362,6 @@ class HandlerBase(BaseGenerativeHandler):
 
                         # Yield the chunk to the client and update the token
                         # count for this output choice.
-                        if request_stats is not None and out["token_ids"]:
-                            request_stats.add_generated(len(out["token_ids"]))
                         yield out
                         output_tokens_per_choice[output_idx] = next_total_toks
 
@@ -1481,9 +1459,6 @@ class HandlerBase(BaseGenerativeHandler):
 
             # Initiate graceful shutdown
             await self._initiate_shutdown(e)
-        finally:
-            if request_stats is not None:
-                request_stats.finish()
 
     @staticmethod
     def _request_has_images(processed_input) -> bool:

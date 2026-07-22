@@ -541,6 +541,7 @@ pub enum ErrorType {
 /// Track response-specific metrics
 pub struct ResponseMetricCollector {
     metrics: Arc<Metrics>,
+    pylon_request: Option<super::pylon_stats::PylonRequestStats>,
     model: String,
     // Per-model metric handles cached for the request. Most are resolved at construction;
     // ITL is resolved lazily on its first observation so requests that never produce ITL
@@ -1604,6 +1605,7 @@ impl ResponseMetricCollector {
             .with_label_values(&[&model]);
         ResponseMetricCollector {
             metrics,
+            pylon_request: None,
             model,
             output_tokens_counter,
             time_to_first_token,
@@ -1638,6 +1640,20 @@ impl ResponseMetricCollector {
             decode_dp_rank: None,
             decode_worker_type: None,
             decode_itl_gauge: None,
+        }
+    }
+
+    pub(super) fn attach_pylon_request(
+        &mut self,
+        stats: super::pylon_stats::PylonStats,
+        identity: super::pylon_stats::PylonRequestIdentity,
+    ) {
+        self.pylon_request = Some(super::pylon_stats::PylonRequestStats::new(stats, identity));
+    }
+
+    fn observe_pylon_request(&mut self, generated_tokens: usize) {
+        if let Some(request) = self.pylon_request.as_mut() {
+            request.observe(generated_tokens);
         }
     }
 
@@ -2007,6 +2023,7 @@ fn observe_llm_metrics(
     response_collector: &mut ResponseMetricCollector,
     http_queue_guard: &mut Option<HttpQueueGuard>,
 ) {
+    response_collector.observe_pylon_request(metrics.chunk_tokens);
     response_collector.observe_current_osl(metrics.output_tokens);
     response_collector.observe_cached_tokens(metrics.cached_tokens);
     response_collector.observe_multimodal_metrics(

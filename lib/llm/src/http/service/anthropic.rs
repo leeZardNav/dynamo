@@ -304,6 +304,7 @@ async fn handler_anthropic_messages(
     })?;
     let mut request = Context::with_id_and_metadata(request, request_id, metadata);
     attach_x_request_id(&mut request, &headers);
+    super::pylon_stats::attach_request_identity(&mut request, &headers);
     if let Some(mut agent_context) = agent_context_from_headers(&headers) {
         agent_context.input_trigger = Some(classify_anthropic_request(request.content()));
         request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context);
@@ -520,7 +521,6 @@ async fn anthropic_messages(
         );
     let parsing_options = parsing_options
         .with_move_reasoning_to_content_when_empty(move_reasoning_to_content_when_empty);
-
     // Computed before `request` moves into `generate`. Only a stream that can
     // withhold every data frame needs forced keep-alive frames.
     let stream_can_defer_all_output =
@@ -529,7 +529,7 @@ async fn anthropic_messages(
             request.chat_template_args.as_ref(),
         );
 
-    let mut response_collector = state.metrics_clone().create_response_collector(&model);
+    let mut response_collector = state.create_response_collector(&model, &request);
 
     tracing::trace!("Issuing generate call for Anthropic messages");
 
