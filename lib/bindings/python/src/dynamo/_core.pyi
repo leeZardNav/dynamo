@@ -147,7 +147,6 @@ class PylonStatsPublisher:
     def publish_stats_event(
         self,
         request_id: str,
-        model: str,
         tokens_processed: Optional[int] = None,
         tokens_generated: Optional[int] = None,
         finished: bool = False,
@@ -155,12 +154,9 @@ class PylonStatsPublisher:
 
     def update_kv_snapshot(
         self,
-        model: str,
         dp_rank: int,
-        expected_dp_ranks: int,
         used_blocks: int,
         total_blocks: int,
-        block_size_tokens: int,
     ) -> None: ...
 
 class Endpoint:
@@ -170,7 +166,12 @@ class Endpoint:
 
     ...
 
-    def pylon_stats_publisher(self) -> Optional[PylonStatsPublisher]:
+    def pylon_stats_publisher(
+        self,
+        model: str,
+        expected_dp_ranks: int,
+        block_size_tokens: int,
+    ) -> Optional[PylonStatsPublisher]:
         """Return the local Pylon publisher when the system server is enabled."""
         ...
 

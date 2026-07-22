@@ -10,7 +10,6 @@ use crate::config::environment_names::runtime::canary as env_canary;
 use crate::config::environment_names::runtime::system as env_system;
 use crate::logging::make_system_request_span;
 use crate::metrics::MetricsHierarchy;
-use crate::pylon_stats::RequestStatsProducerStatus;
 use crate::traits::DistributedRuntimeProvider;
 use axum::{
     Router,
@@ -294,28 +293,15 @@ async fn pylon_stats_stream_handler(
     stats: crate::pylon_stats::PylonStats,
     shutdown: CancellationToken,
 ) -> Response {
-    match stats.request_stats_producer_status() {
-        RequestStatsProducerStatus::Pending => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "pylon_stats_initializing",
-                    "message": "request stats producer registration is still in progress",
-                })),
-            )
-                .into_response();
-        }
-        RequestStatsProducerStatus::Unavailable => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                Json(json!({
-                    "error": "pylon_stats_not_supported",
-                    "message": "no Pylon stats producer is attached to this worker",
-                })),
-            )
-                .into_response();
-        }
-        RequestStatsProducerStatus::Available => {}
+    if !stats.request_stats_producer_available() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "pylon_stats_not_supported",
+                "message": "no Pylon stats producer is attached to this worker",
+            })),
+        )
+            .into_response();
     }
 
     let mut receiver = stats.subscribe_request_stats();
@@ -821,16 +807,8 @@ mod tests {
     use tokio::time::Duration;
 
     #[tokio::test]
-    async fn pylon_stats_stream_route_distinguishes_startup_from_unsupported_backends() {
+    async fn pylon_stats_stream_route_rejects_unsupported_backends() {
         let stats = crate::pylon_stats::PylonStats::default();
-        let response = pylon_stats_stream_handler(stats.clone(), CancellationToken::new()).await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"], "pylon_stats_initializing");
-
-        stats.complete_request_stats_producer_registration();
         let response = pylon_stats_stream_handler(stats, CancellationToken::new()).await;
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
@@ -918,14 +896,12 @@ mod tests {
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"], "kv_cache_stats_not_ready");
 
+        stats.configure_kv_cache("model-a", 2, 16).unwrap();
         stats
             .update_kv_snapshot(crate::pylon_stats::KvCacheSnapshot {
-                model: "model-a",
                 dp_rank: 0,
-                expected_dp_ranks: 2,
                 used_blocks: 4,
                 total_blocks: 10,
-                block_size_tokens: 16,
             })
             .unwrap();
         let response = kv_cache_stats_handler(stats).await;
@@ -938,15 +914,13 @@ mod tests {
     #[tokio::test]
     async fn kv_cache_stats_route_returns_aggregated_token_counts() {
         let stats = crate::pylon_stats::PylonStats::default();
+        stats.configure_kv_cache("served-model", 2, 16).unwrap();
         for (rank, used, total) in [(0, 4, 10), (1, 6, 20)] {
             stats
                 .update_kv_snapshot(crate::pylon_stats::KvCacheSnapshot {
-                    model: "served-model",
                     dp_rank: rank,
-                    expected_dp_ranks: 2,
                     used_blocks: used,
                     total_blocks: total,
-                    block_size_tokens: 16,
                 })
                 .unwrap();
         }
@@ -968,31 +942,6 @@ mod tests {
                 "kv_cache_free_tokens": 320,
             })
         );
-    }
-
-    #[tokio::test]
-    async fn kv_cache_stats_route_rejects_ambiguous_models() {
-        let stats = crate::pylon_stats::PylonStats::default();
-        for model in ["model-a", "model-b"] {
-            stats
-                .update_kv_snapshot(crate::pylon_stats::KvCacheSnapshot {
-                    model,
-                    dp_rank: 0,
-                    expected_dp_ranks: 1,
-                    used_blocks: 4,
-                    total_blocks: 10,
-                    block_size_tokens: 16,
-                })
-                .unwrap();
-        }
-
-        let response = kv_cache_stats_handler(stats).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"], "kv_cache_stats_unavailable");
-        assert!(error["message"].as_str().unwrap().contains("model-a"));
-        assert!(error["message"].as_str().unwrap().contains("model-b"));
     }
 
     // This is a basic test to verify the HTTP server is working before testing other more complicated tests

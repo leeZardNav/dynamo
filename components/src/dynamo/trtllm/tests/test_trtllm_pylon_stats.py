@@ -17,7 +17,10 @@ from dynamo.trtllm.constants import DisaggregationMode
 
 try:
     from dynamo.trtllm.publisher import Publisher
-    from dynamo.trtllm.request_handlers.handler_base import HandlerBase
+    from dynamo.trtllm.request_handlers.handler_base import (
+        HandlerBase,
+        RequestHandlerConfig,
+    )
 except ImportError as e:
     pytest.skip(f"tensorrt_llm backend not available: {e}", allow_module_level=True)
 
@@ -49,7 +52,6 @@ class _PylonPublisher:
     def publish_stats_event(
         self,
         request_id: str,
-        model: str,
         tokens_processed: int | None = None,
         tokens_generated: int | None = None,
         finished: bool = False,
@@ -57,7 +59,6 @@ class _PylonPublisher:
         self.events.append(
             {
                 "request_id": request_id,
-                "model": model,
                 "tokens_processed": tokens_processed,
                 "tokens_generated": tokens_generated,
                 "finished": finished,
@@ -97,21 +98,19 @@ def _result(
 def _make_handler(
     generate_async: Callable[..., Any], publisher: _PylonPublisher | None
 ) -> _Handler:
-    handler = _Handler.__new__(_Handler)
-    handler.engine = SimpleNamespace(llm=SimpleNamespace(generate_async=generate_async))
-    handler.default_sampling_params = SimpleNamespace(max_tokens=None)
-    handler.publisher = None
-    handler.metrics_collector = None
-    handler.disaggregation_mode = DisaggregationMode.AGGREGATED
-    handler.multimodal_processor = None
-    handler.additional_metrics = None
-    handler.kv_block_size = 16
-    handler.max_seq_len = 1024
-    handler.first_generation = False
+    engine = SimpleNamespace(llm=SimpleNamespace(generate_async=generate_async))
+    handler = _Handler(
+        RequestHandlerConfig(
+            engine=engine,
+            default_sampling_params=SimpleNamespace(max_tokens=None),
+            publisher=None,
+            disaggregation_mode=DisaggregationMode.AGGREGATED,
+            kv_block_size=16,
+            max_seq_len=1024,
+            pylon_stats_publisher=publisher,
+        )
+    )
     handler._conversation_affinity = False
-    handler._engine_conversation_affinity_override = False
-    handler._pylon_stats_publisher = publisher
-    handler._pylon_model_name = "served-model"
     handler._normalize_request_format = lambda request: None
     handler._setup_disaggregated_params_for_mode = lambda request, ep_params: (
         None,
@@ -166,7 +165,6 @@ async def test_request_stats_sum_choices_without_recounting_regressions():
     assert len(chunks) == 7
     assert pylon.events[0] == {
         "request_id": "req-1",
-        "model": "served-model",
         "tokens_processed": 3,
         "tokens_generated": None,
         "finished": False,
@@ -178,7 +176,6 @@ async def test_request_stats_sum_choices_without_recounting_regressions():
     ] == [1, 2, 3, 4, 5]
     assert pylon.events[-1] == {
         "request_id": "req-1",
-        "model": "served-model",
         "tokens_processed": 3,
         "tokens_generated": 5,
         "finished": True,
@@ -197,7 +194,6 @@ async def test_backend_error_closes_without_prompt_progress():
     assert pylon.events == [
         {
             "request_id": "req-1",
-            "model": "served-model",
             "tokens_processed": None,
             "tokens_generated": None,
             "finished": True,
@@ -249,20 +245,23 @@ def _make_metrics_publisher(
     *,
     attention_dp_size: int,
 ) -> Publisher:
-    publisher = Publisher.__new__(Publisher)
-    publisher.engine = SimpleNamespace(llm=SimpleNamespace())
-    publisher.metrics_publisher = SimpleNamespace(publish=lambda *args, **kwargs: None)
-    publisher.component_gauges = SimpleNamespace(
+    engine = SimpleNamespace(
+        llm=SimpleNamespace(), get_attention_dp_size=lambda: attention_dp_size
+    )
+    component_gauges = SimpleNamespace(
         set_total_blocks=lambda *args: None,
         set_gpu_cache_usage=lambda *args: None,
     )
-    publisher.metrics_collector = None
-    publisher.fpm_publisher = None
-    publisher._fpm_schema_checked = False
-    publisher._pylon_stats_publisher = pylon
-    publisher._pylon_model_name = "served-model"
-    publisher.attention_dp_size = attention_dp_size
-    publisher.kv_block_size = 16
+    publisher = Publisher(
+        endpoint=SimpleNamespace(),
+        engine=engine,
+        worker_id=1,
+        kv_block_size=16,
+        metrics_labels=[],
+        component_gauges=component_gauges,
+        pylon_stats_publisher=pylon,
+    )
+    publisher.metrics_publisher = SimpleNamespace(publish=lambda *args, **kwargs: None)
 
     async def polling_loop(
         fetch_fn,
@@ -300,8 +299,8 @@ async def test_kv_cache_reuses_existing_metrics_observations_for_all_ranks():
     await publisher._publish_stats_task()
 
     assert pylon.kv_snapshots == [
-        ("served-model", 0, 2, 4, 10, 16),
-        ("served-model", 1, 2, 6, 20, 16),
+        (0, 4, 10),
+        (1, 6, 20),
     ]
 
 

@@ -35,13 +35,12 @@ import msgspec
 import zmq
 from prometheus_client import CollectorRegistry
 
-from dynamo.common.pylon_stats import PylonStatsPublisher
 from dynamo.common.utils.prometheus import LLMBackendMetrics
 from dynamo.llm import FpmDirectPublisher, KvEventPublisher, WorkerMetricsPublisher
 from dynamo.trtllm.utils.request_utils import stored_event_cache_salt
 
 if TYPE_CHECKING:
-    from dynamo._core import KvRemovedEventInput, KvStoredEventInput
+    from dynamo._core import KvRemovedEventInput, KvStoredEventInput, PylonStatsPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -402,8 +401,7 @@ class Publisher:
         metrics_collector: Any = None,
         kv_state_endpoint: Optional[str] = None,
         image_token_id: Optional[int] = None,
-        pylon_stats_publisher: Optional[PylonStatsPublisher] = None,
-        pylon_model_name: str = "",
+        pylon_stats_publisher: Optional["PylonStatsPublisher"] = None,
     ) -> None:
         self.endpoint = endpoint
         self.engine = engine
@@ -421,7 +419,6 @@ class Publisher:
         self.image_token_id = image_token_id
         self.attention_dp_size = engine.get_attention_dp_size()
         self._pylon_stats_publisher = pylon_stats_publisher
-        self._pylon_model_name = pylon_model_name
 
         # The first few kv events from the model engine are always "created" type events.
         # Use these events to capture the max_window_size of the model.
@@ -715,12 +712,9 @@ class Publisher:
             ):
                 try:
                     pylon_publisher.update_kv_snapshot(
-                        self._pylon_model_name,
                         dp_rank,
-                        self.attention_dp_size,
                         kv_active_blocks,
                         kv_total_blocks,
-                        self.kv_block_size,
                     )
                 except (OverflowError, RuntimeError, TypeError, ValueError) as e:
                     logging.debug("Pylon KV snapshot update rejected: %s", e)
@@ -1173,8 +1167,7 @@ async def get_publisher(
     metrics_collector: Any = None,
     kv_state_endpoint: Optional[str] = None,
     image_token_id: Optional[int] = None,
-    pylon_stats_publisher: Optional[PylonStatsPublisher] = None,
-    pylon_model_name: str = "",
+    pylon_stats_publisher: Optional["PylonStatsPublisher"] = None,
 ) -> AsyncGenerator[Publisher, None]:
     publisher = Publisher(
         endpoint,
@@ -1191,7 +1184,6 @@ async def get_publisher(
         kv_state_endpoint=kv_state_endpoint,
         image_token_id=image_token_id,
         pylon_stats_publisher=pylon_stats_publisher,
-        pylon_model_name=pylon_model_name,
     )
     try:
         publisher.initialize()

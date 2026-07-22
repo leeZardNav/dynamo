@@ -878,12 +878,6 @@ impl Worker {
         // still runs before `register_engine_controls`, so `/engine/*` cannot
         // fire before the engine has the endpoint.
         self.engine.on_endpoint_ready(endpoint.clone()).await?;
-        // Keep the stream retryable during handoff; only settle unsupported
-        // after the engine has had a chance to attach its producer.
-        endpoint
-            .drt()
-            .pylon_stats()
-            .complete_request_stats_producer_registration();
 
         local_model
             .attach(
@@ -3183,7 +3177,7 @@ mod handoff_integration_tests {
 
     /// `serve_with_orchestrator` runs `on_endpoint_ready` before
     /// `register_engine_controls` and `register_engine_updates`. Drive the same
-    /// production sequence and assert: (1) the handoff is
+    /// three production calls in that order and assert: (1) the handoff is
     /// observed before the engine is asked for its controls/updates, and (2) the
     /// advertised control lands under `control/<name>` and the advertised update
     /// under `update/<name>` in the DRT's engine-route registry, so
@@ -3204,10 +3198,6 @@ mod handoff_integration_tests {
             .on_endpoint_ready(endpoint.clone())
             .await
             .expect("handoff should succeed");
-        endpoint
-            .drt()
-            .pylon_stats()
-            .complete_request_stats_producer_registration();
         worker
             .register_engine_controls(&endpoint)
             .await

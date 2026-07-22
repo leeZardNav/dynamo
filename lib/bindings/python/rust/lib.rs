@@ -1346,10 +1346,23 @@ impl DistributedRuntime {
 #[pymethods]
 impl Endpoint {
     /// Return a publisher only when this process exposes the system server.
-    fn pylon_stats_publisher(&self) -> Option<pylon_stats::PylonStatsPublisher> {
-        self.inner.drt().system_status_server_info().map(|_| {
-            pylon_stats::PylonStatsPublisher::attach(self.inner.drt().pylon_stats().clone())
-        })
+    fn pylon_stats_publisher(
+        &self,
+        model: &str,
+        expected_dp_ranks: u32,
+        block_size_tokens: u32,
+    ) -> PyResult<Option<pylon_stats::PylonStatsPublisher>> {
+        if self.inner.drt().system_status_server_info().is_none() {
+            return Ok(None);
+        }
+
+        pylon_stats::PylonStatsPublisher::attach(
+            self.inner.drt().pylon_stats().clone(),
+            model,
+            expected_dp_ranks,
+            block_size_tokens,
+        )
+        .map(Some)
     }
 
     #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]

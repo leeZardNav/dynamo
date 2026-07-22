@@ -37,7 +37,7 @@ from dynamo.common.backend import logprobs as _shared_logprobs
 from dynamo.common.backend.engine import is_generation_stage
 from dynamo.common.constants import DisaggregationMode as CommonDisaggregationMode
 from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
-from dynamo.common.pylon_stats import PylonRequestStats, PylonStatsPublisher
+from dynamo.common.pylon_stats import PylonRequestStats
 from dynamo.common.utils.structural_tag import serialize_structural_tag
 from dynamo.health_check import HEALTH_CHECK_KEY
 from dynamo.llm.exceptions import EngineShutdown
@@ -70,6 +70,8 @@ from dynamo.trtllm.utils.request_utils import (
 )
 
 if TYPE_CHECKING:
+    from dynamo._core import PylonStatsPublisher
+
     # tensorrt_llm may use a different version that doesn't have MetricsCollector,
     # so guard this import inside TYPE_CHECKING to avoid runtime import errors.
     from tensorrt_llm.metrics import MetricsCollector
@@ -255,6 +257,7 @@ class RequestHandlerConfig:
     conversation_affinity: bool = False
     # Select whether the engine or Dynamo owns initial DP-rank placement in affinity mode.
     conversation_affinity_dp_rank_source: str = "engine"
+    pylon_stats_publisher: Optional["PylonStatsPublisher"] = None
 
 
 class HandlerBase(BaseGenerativeHandler):
@@ -305,14 +308,7 @@ class HandlerBase(BaseGenerativeHandler):
         self._no_inflight_requests.set()
         self._pause_controller = TRTLLMEnginePauseController(config.engine)
         self._reject_new_requests = False
-        self._pylon_stats_publisher: Optional[PylonStatsPublisher] = None
-        self._pylon_model_name = ""
-
-    def attach_pylon_stats_publisher(
-        self, publisher: Optional[PylonStatsPublisher], model_name: str
-    ) -> None:
-        self._pylon_stats_publisher = publisher
-        self._pylon_model_name = model_name
+        self._pylon_stats_publisher = config.pylon_stats_publisher
 
     def check_error(self, result: dict) -> bool:
         """
@@ -1232,7 +1228,6 @@ class HandlerBase(BaseGenerativeHandler):
             PylonRequestStats(
                 pylon_publisher,
                 context.id(),
-                self._pylon_model_name,
             )
             if pylon_publisher is not None
             else None

@@ -3,9 +3,8 @@
 
 //! Bounded request-stats fanout and latest observed KV state for Pylon routes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -26,13 +25,10 @@ pub struct RequestStatsUpdate<'a> {
 
 /// Latest reliable KV block observation for one local DP rank.
 #[derive(Clone, Copy, Debug)]
-pub struct KvCacheSnapshot<'a> {
-    pub model: &'a str,
+pub struct KvCacheSnapshot {
     pub dp_rank: u32,
-    pub expected_dp_ranks: u32,
     pub used_blocks: u64,
     pub total_blocks: u64,
-    pub block_size_tokens: u32,
 }
 
 /// Pylon's worker-local `/kv-cache/stats` response.
@@ -57,7 +53,7 @@ pub enum RequestStatsPublishError {
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
-pub enum KvCacheSnapshotError {
+pub enum KvCacheUpdateError {
     #[error("model must not be empty")]
     EmptyModel,
     #[error("expected_dp_ranks must be greater than zero")]
@@ -68,24 +64,18 @@ pub enum KvCacheSnapshotError {
     ZeroTotalBlocks,
     #[error("used_blocks ({used_blocks}) exceeds total_blocks ({total_blocks})")]
     UsedBlocksExceedTotal { used_blocks: u64, total_blocks: u64 },
-    #[error("model {model:?} changed expected local DP ranks from {previous} to {observed}")]
-    ExpectedDpRanksChanged {
-        model: String,
-        previous: u32,
-        observed: u32,
+    #[error(
+        "KV cache is already configured for model {configured_model:?} with {configured_dp_ranks} local DP ranks and {configured_block_size} tokens per block"
+    )]
+    ConflictingConfiguration {
+        configured_model: String,
+        configured_dp_ranks: u32,
+        configured_block_size: u32,
     },
-    #[error("model {model:?} changed KV block size from {previous} to {observed} tokens")]
-    BlockSizeChanged {
-        model: String,
-        previous: u32,
-        observed: u32,
-    },
-    #[error("rank {dp_rank} is outside model {model:?}'s {expected} local DP ranks")]
-    UnexpectedDpRank {
-        model: String,
-        dp_rank: u32,
-        expected: u32,
-    },
+    #[error("KV cache must be configured before snapshots are published")]
+    NotConfigured,
+    #[error("rank {dp_rank} is outside the configured {expected} local DP ranks")]
+    UnexpectedDpRank { dp_rank: u32, expected: u32 },
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -100,8 +90,6 @@ pub enum KvCacheStatsUnavailable {
         observed: usize,
         expected: u32,
     },
-    #[error("KV-cache stats are ambiguous across local models: {models:?}")]
-    AmbiguousModels { models: Vec<String> },
     #[error("KV-cache token counts overflowed for model {model:?}")]
     TokenCountOverflow { model: String },
 }
@@ -110,9 +98,7 @@ impl KvCacheStatsUnavailable {
     pub(crate) fn response_code(&self) -> &'static str {
         match self {
             Self::NoSnapshots | Self::IncompleteDpRanks { .. } => "kv_cache_stats_not_ready",
-            Self::AmbiguousModels { .. } | Self::TokenCountOverflow { .. } => {
-                "kv_cache_stats_unavailable"
-            }
+            Self::TokenCountOverflow { .. } => "kv_cache_stats_unavailable",
         }
     }
 }
@@ -123,29 +109,21 @@ pub struct PylonStats {
 }
 
 struct PylonStatsInner {
-    request_stats_producer_status: AtomicU8,
+    request_stats_producer_available: AtomicBool,
     request_stats_tx: broadcast::Sender<Bytes>,
-    kv_models: Mutex<HashMap<String, ModelKvState>>,
+    kv_state: Mutex<Option<ModelKvState>>,
 }
 
 struct ModelKvState {
-    expected_dp_ranks: u32,
+    model: String,
     block_size_tokens: u32,
-    ranks: HashMap<u32, RankKvSnapshot>,
+    ranks: Vec<Option<RankKvSnapshot>>,
 }
 
 #[derive(Clone, Copy)]
 struct RankKvSnapshot {
     used_blocks: u64,
     total_blocks: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum RequestStatsProducerStatus {
-    Pending,
-    Available,
-    Unavailable,
 }
 
 #[derive(Serialize)]
@@ -173,47 +151,24 @@ impl PylonStats {
         let (request_stats_tx, _) = broadcast::channel(request_stats_capacity);
         Self {
             inner: Arc::new(PylonStatsInner {
-                request_stats_producer_status: AtomicU8::new(
-                    RequestStatsProducerStatus::Pending as u8,
-                ),
+                request_stats_producer_available: AtomicBool::new(false),
                 request_stats_tx,
-                kv_models: Mutex::new(HashMap::new()),
+                kv_state: Mutex::new(None),
             }),
         }
     }
 
     /// Mark request stats available before the worker enters discovery.
     pub fn mark_request_stats_producer_available(&self) {
-        self.inner.request_stats_producer_status.store(
-            RequestStatsProducerStatus::Available as u8,
-            Ordering::Relaxed,
-        );
+        self.inner
+            .request_stats_producer_available
+            .store(true, Ordering::Relaxed);
     }
 
-    /// Finish backend handoff without overriding an attached producer.
-    pub fn complete_request_stats_producer_registration(&self) {
-        let _ = self.inner.request_stats_producer_status.compare_exchange(
-            RequestStatsProducerStatus::Pending as u8,
-            RequestStatsProducerStatus::Unavailable as u8,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-
-    pub(crate) fn request_stats_producer_status(&self) -> RequestStatsProducerStatus {
-        match self
-            .inner
-            .request_stats_producer_status
+    pub(crate) fn request_stats_producer_available(&self) -> bool {
+        self.inner
+            .request_stats_producer_available
             .load(Ordering::Relaxed)
-        {
-            status if status == RequestStatsProducerStatus::Available as u8 => {
-                RequestStatsProducerStatus::Available
-            }
-            status if status == RequestStatsProducerStatus::Unavailable as u8 => {
-                RequestStatsProducerStatus::Unavailable
-            }
-            _ => RequestStatsProducerStatus::Pending,
-        }
     }
 
     /// Validate, serialize, and publish one cumulative request update.
@@ -265,35 +220,56 @@ impl PylonStats {
         self.inner.request_stats_tx.subscribe()
     }
 
-    /// Replace the latest reliable block observation for one model/rank.
-    pub fn update_kv_snapshot(
+    /// Configure immutable KV-cache geometry for this worker.
+    pub fn configure_kv_cache(
         &self,
-        snapshot: KvCacheSnapshot<'_>,
-    ) -> Result<(), KvCacheSnapshotError> {
-        let model = snapshot.model.trim();
+        model: &str,
+        expected_dp_ranks: u32,
+        block_size_tokens: u32,
+    ) -> Result<(), KvCacheUpdateError> {
+        let model = model.trim();
         if model.is_empty() {
-            return Err(KvCacheSnapshotError::EmptyModel);
+            return Err(KvCacheUpdateError::EmptyModel);
         }
-        if snapshot.expected_dp_ranks == 0 {
-            return Err(KvCacheSnapshotError::ZeroExpectedDpRanks);
+        if expected_dp_ranks == 0 {
+            return Err(KvCacheUpdateError::ZeroExpectedDpRanks);
         }
-        if snapshot.block_size_tokens == 0 {
-            return Err(KvCacheSnapshotError::ZeroBlockSize);
+        if block_size_tokens == 0 {
+            return Err(KvCacheUpdateError::ZeroBlockSize);
         }
-        if snapshot.total_blocks == 0 {
-            return Err(KvCacheSnapshotError::ZeroTotalBlocks);
-        }
-        if snapshot.used_blocks > snapshot.total_blocks {
-            return Err(KvCacheSnapshotError::UsedBlocksExceedTotal {
-                used_blocks: snapshot.used_blocks,
-                total_blocks: snapshot.total_blocks,
+
+        let mut state = self.inner.kv_state.lock();
+        if let Some(configured) = state.as_ref() {
+            if configured.model == model
+                && configured.ranks.len() == expected_dp_ranks as usize
+                && configured.block_size_tokens == block_size_tokens
+            {
+                return Ok(());
+            }
+            return Err(KvCacheUpdateError::ConflictingConfiguration {
+                configured_model: configured.model.clone(),
+                configured_dp_ranks: configured.ranks.len() as u32,
+                configured_block_size: configured.block_size_tokens,
             });
         }
-        if snapshot.dp_rank >= snapshot.expected_dp_ranks {
-            return Err(KvCacheSnapshotError::UnexpectedDpRank {
-                model: model.to_owned(),
-                dp_rank: snapshot.dp_rank,
-                expected: snapshot.expected_dp_ranks,
+
+        *state = Some(ModelKvState {
+            model: model.to_owned(),
+            block_size_tokens,
+            ranks: vec![None; expected_dp_ranks as usize],
+        });
+        Ok(())
+    }
+
+    /// Replace the latest reliable block observation for one local DP rank.
+    pub fn update_kv_snapshot(&self, snapshot: KvCacheSnapshot) -> Result<(), KvCacheUpdateError> {
+        if snapshot.total_blocks == 0 {
+            return Err(KvCacheUpdateError::ZeroTotalBlocks);
+        }
+        if snapshot.used_blocks > snapshot.total_blocks {
+            return Err(KvCacheUpdateError::UsedBlocksExceedTotal {
+                used_blocks: snapshot.used_blocks,
+                total_blocks: snapshot.total_blocks,
             });
         }
 
@@ -301,87 +277,63 @@ impl PylonStats {
             used_blocks: snapshot.used_blocks,
             total_blocks: snapshot.total_blocks,
         };
-        let mut models = self.inner.kv_models.lock();
-        if let Some(state) = models.get_mut(model) {
-            if state.expected_dp_ranks != snapshot.expected_dp_ranks {
-                return Err(KvCacheSnapshotError::ExpectedDpRanksChanged {
-                    model: model.to_owned(),
-                    previous: state.expected_dp_ranks,
-                    observed: snapshot.expected_dp_ranks,
-                });
-            }
-            if state.block_size_tokens != snapshot.block_size_tokens {
-                return Err(KvCacheSnapshotError::BlockSizeChanged {
-                    model: model.to_owned(),
-                    previous: state.block_size_tokens,
-                    observed: snapshot.block_size_tokens,
-                });
-            }
-            state.ranks.insert(snapshot.dp_rank, rank);
-        } else {
-            models.insert(
-                model.to_owned(),
-                ModelKvState {
-                    expected_dp_ranks: snapshot.expected_dp_ranks,
-                    block_size_tokens: snapshot.block_size_tokens,
-                    ranks: HashMap::from([(snapshot.dp_rank, rank)]),
-                },
-            );
-        }
+        let mut state = self.inner.kv_state.lock();
+        let state = state.as_mut().ok_or(KvCacheUpdateError::NotConfigured)?;
+        let expected = state.ranks.len() as u32;
+        let slot = state.ranks.get_mut(snapshot.dp_rank as usize).ok_or(
+            KvCacheUpdateError::UnexpectedDpRank {
+                dp_rank: snapshot.dp_rank,
+                expected,
+            },
+        )?;
+        *slot = Some(rank);
         Ok(())
     }
 
-    /// Derive Pylon's token response from the latest complete single-model state.
+    /// Derive Pylon's token response from the latest complete state.
     pub fn kv_cache_stats(&self) -> Result<KvCacheStats, KvCacheStatsUnavailable> {
-        let models = self.inner.kv_models.lock();
-        if models.len() > 1 {
-            let mut model_names: Vec<_> = models.keys().cloned().collect();
-            model_names.sort_unstable();
-            return Err(KvCacheStatsUnavailable::AmbiguousModels {
-                models: model_names,
-            });
+        let state = self.inner.kv_state.lock();
+        let state = state.as_ref().ok_or(KvCacheStatsUnavailable::NoSnapshots)?;
+        let observed = state.ranks.iter().flatten().count();
+        if observed == 0 {
+            return Err(KvCacheStatsUnavailable::NoSnapshots);
         }
-
-        let (model, state) = models
-            .iter()
-            .next()
-            .ok_or(KvCacheStatsUnavailable::NoSnapshots)?;
-        if state.ranks.len() != state.expected_dp_ranks as usize {
+        if observed != state.ranks.len() {
             return Err(KvCacheStatsUnavailable::IncompleteDpRanks {
-                model: model.clone(),
-                observed: state.ranks.len(),
-                expected: state.expected_dp_ranks,
+                model: state.model.clone(),
+                observed,
+                expected: state.ranks.len() as u32,
             });
         }
 
         let mut total_blocks = 0_u64;
         let mut used_blocks = 0_u64;
-        for snapshot in state.ranks.values() {
+        for snapshot in state.ranks.iter().flatten() {
             total_blocks = total_blocks
                 .checked_add(snapshot.total_blocks)
                 .ok_or_else(|| KvCacheStatsUnavailable::TokenCountOverflow {
-                    model: model.clone(),
+                    model: state.model.clone(),
                 })?;
             used_blocks = used_blocks
                 .checked_add(snapshot.used_blocks)
                 .ok_or_else(|| KvCacheStatsUnavailable::TokenCountOverflow {
-                    model: model.clone(),
+                    model: state.model.clone(),
                 })?;
         }
         let block_size = u64::from(state.block_size_tokens);
         let capacity_tokens = total_blocks.checked_mul(block_size).ok_or_else(|| {
             KvCacheStatsUnavailable::TokenCountOverflow {
-                model: model.clone(),
+                model: state.model.clone(),
             }
         })?;
         let used_tokens = used_blocks.checked_mul(block_size).ok_or_else(|| {
             KvCacheStatsUnavailable::TokenCountOverflow {
-                model: model.clone(),
+                model: state.model.clone(),
             }
         })?;
 
         Ok(KvCacheStats {
-            model: model.clone(),
+            model: state.model.clone(),
             kv_cache_capacity_tokens: capacity_tokens,
             kv_cache_used_tokens: used_tokens,
             kv_cache_free_tokens: capacity_tokens - used_tokens,
@@ -404,14 +356,19 @@ mod tests {
         }
     }
 
-    fn kv_snapshot(model: &str, rank: u32, expected_dp_ranks: u32) -> KvCacheSnapshot<'_> {
+    fn configured_stats(expected_dp_ranks: u32) -> PylonStats {
+        let stats = PylonStats::default();
+        stats
+            .configure_kv_cache("model-a", expected_dp_ranks, 16)
+            .unwrap();
+        stats
+    }
+
+    fn kv_snapshot(rank: u32) -> KvCacheSnapshot {
         KvCacheSnapshot {
-            model,
             dp_rank: rank,
-            expected_dp_ranks,
             used_blocks: 4,
             total_blocks: 10,
-            block_size_tokens: 16,
         }
     }
 
@@ -511,25 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn request_stats_producer_registration_preserves_late_attachment() {
+    fn request_stats_producer_is_available_after_attachment() {
         let stats = PylonStats::default();
-        assert_eq!(
-            stats.request_stats_producer_status(),
-            RequestStatsProducerStatus::Pending
-        );
-
-        stats.complete_request_stats_producer_registration();
-        assert_eq!(
-            stats.request_stats_producer_status(),
-            RequestStatsProducerStatus::Unavailable
-        );
+        assert!(!stats.request_stats_producer_available());
 
         stats.mark_request_stats_producer_available();
-        stats.complete_request_stats_producer_registration();
-        assert_eq!(
-            stats.request_stats_producer_status(),
-            RequestStatsProducerStatus::Available
-        );
+        assert!(stats.request_stats_producer_available());
     }
 
     #[test]
@@ -541,11 +485,30 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_stats_waits_for_every_local_dp_rank_and_aggregates_tokens() {
+    fn kv_cache_rejects_invalid_configuration_and_unconfigured_updates() {
         let stats = PylonStats::default();
-        stats
-            .update_kv_snapshot(kv_snapshot("model-a", 0, 2))
-            .unwrap();
+        assert_eq!(
+            stats.configure_kv_cache(" ", 1, 16),
+            Err(KvCacheUpdateError::EmptyModel)
+        );
+        assert_eq!(
+            stats.configure_kv_cache("model-a", 0, 16),
+            Err(KvCacheUpdateError::ZeroExpectedDpRanks)
+        );
+        assert_eq!(
+            stats.configure_kv_cache("model-a", 1, 0),
+            Err(KvCacheUpdateError::ZeroBlockSize)
+        );
+        assert_eq!(
+            stats.update_kv_snapshot(kv_snapshot(0)),
+            Err(KvCacheUpdateError::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn kv_cache_stats_waits_for_every_local_dp_rank_and_aggregates_tokens() {
+        let stats = configured_stats(2);
+        stats.update_kv_snapshot(kv_snapshot(0)).unwrap();
         assert_eq!(
             stats.kv_cache_stats(),
             Err(KvCacheStatsUnavailable::IncompleteDpRanks {
@@ -555,21 +518,10 @@ mod tests {
             })
         );
 
-        let mut rank_one = kv_snapshot("model-a", 1, 2);
+        let mut rank_one = kv_snapshot(1);
         rank_one.used_blocks = 6;
         rank_one.total_blocks = 20;
         stats.update_kv_snapshot(rank_one).unwrap();
-
-        let mut mismatched_block_size = rank_one;
-        mismatched_block_size.block_size_tokens = 32;
-        assert_eq!(
-            stats.update_kv_snapshot(mismatched_block_size),
-            Err(KvCacheSnapshotError::BlockSizeChanged {
-                model: "model-a".to_string(),
-                previous: 16,
-                observed: 32,
-            })
-        );
 
         assert_eq!(
             stats.kv_cache_stats().unwrap(),
@@ -583,32 +535,30 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_stats_fails_closed_for_multiple_models() {
+    fn kv_cache_configuration_is_idempotent_but_cannot_change() {
         let stats = PylonStats::default();
-        stats
-            .update_kv_snapshot(kv_snapshot("model-b", 0, 1))
-            .unwrap();
-        stats
-            .update_kv_snapshot(kv_snapshot("model-a", 0, 1))
-            .unwrap();
+        stats.configure_kv_cache("model-a", 2, 16).unwrap();
+        stats.configure_kv_cache("model-a", 2, 16).unwrap();
 
         assert_eq!(
-            stats.kv_cache_stats(),
-            Err(KvCacheStatsUnavailable::AmbiguousModels {
-                models: vec!["model-a".to_string(), "model-b".to_string()],
+            stats.configure_kv_cache("model-b", 1, 32),
+            Err(KvCacheUpdateError::ConflictingConfiguration {
+                configured_model: "model-a".to_string(),
+                configured_dp_ranks: 2,
+                configured_block_size: 16,
             })
         );
     }
 
     #[test]
     fn invalid_kv_snapshot_does_not_create_available_state() {
-        let stats = PylonStats::default();
-        let mut snapshot = kv_snapshot("model-a", 0, 1);
+        let stats = configured_stats(1);
+        let mut snapshot = kv_snapshot(0);
         snapshot.used_blocks = 11;
 
         assert_eq!(
             stats.update_kv_snapshot(snapshot),
-            Err(KvCacheSnapshotError::UsedBlocksExceedTotal {
+            Err(KvCacheUpdateError::UsedBlocksExceedTotal {
                 used_blocks: 11,
                 total_blocks: 10,
             })
@@ -621,12 +571,11 @@ mod tests {
 
     #[test]
     fn out_of_range_dp_rank_does_not_create_available_state() {
-        let stats = PylonStats::default();
+        let stats = configured_stats(1);
 
         assert_eq!(
-            stats.update_kv_snapshot(kv_snapshot("model-a", 1, 1)),
-            Err(KvCacheSnapshotError::UnexpectedDpRank {
-                model: "model-a".to_string(),
+            stats.update_kv_snapshot(kv_snapshot(1)),
+            Err(KvCacheUpdateError::UnexpectedDpRank {
                 dp_rank: 1,
                 expected: 1,
             })
@@ -640,14 +589,12 @@ mod tests {
     #[test]
     fn kv_cache_stats_fails_closed_on_token_count_overflow() {
         let stats = PylonStats::default();
+        stats.configure_kv_cache("model-a", 1, 2).unwrap();
         stats
             .update_kv_snapshot(KvCacheSnapshot {
-                model: "model-a",
                 dp_rank: 0,
-                expected_dp_ranks: 1,
                 used_blocks: 0,
                 total_blocks: u64::MAX,
-                block_size_tokens: 2,
             })
             .unwrap();
 

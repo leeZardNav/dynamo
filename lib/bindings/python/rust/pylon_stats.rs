@@ -14,23 +14,34 @@ use pyo3::prelude::*;
 #[pyclass(module = "dynamo._core", frozen)]
 pub(crate) struct PylonStatsPublisher {
     inner: PylonStats,
+    model: String,
 }
 
 impl PylonStatsPublisher {
-    pub(crate) fn attach(inner: PylonStats) -> Self {
+    pub(crate) fn attach(
+        inner: PylonStats,
+        model: &str,
+        expected_dp_ranks: u32,
+        block_size_tokens: u32,
+    ) -> PyResult<Self> {
+        inner
+            .configure_kv_cache(model, expected_dp_ranks, block_size_tokens)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         inner.mark_request_stats_producer_available();
-        Self { inner }
+        Ok(Self {
+            inner,
+            model: model.trim().to_owned(),
+        })
     }
 }
 
 #[pymethods]
 impl PylonStatsPublisher {
     /// Publish one cumulative request-counter event without blocking inference.
-    #[pyo3(signature = (request_id, model, tokens_processed=None, tokens_generated=None, finished=false))]
+    #[pyo3(signature = (request_id, tokens_processed=None, tokens_generated=None, finished=false))]
     fn publish_stats_event(
         &self,
         request_id: &str,
-        model: &str,
         tokens_processed: Option<u64>,
         tokens_generated: Option<u64>,
         finished: bool,
@@ -38,7 +49,7 @@ impl PylonStatsPublisher {
         self.inner
             .publish_request_stats(RequestStatsUpdate {
                 request_id,
-                model,
+                model: &self.model,
                 tokens_processed,
                 tokens_generated,
                 finished,
@@ -47,24 +58,18 @@ impl PylonStatsPublisher {
     }
 
     /// Replace one rank's latest observed KV block state.
-    #[pyo3(signature = (model, dp_rank, expected_dp_ranks, used_blocks, total_blocks, block_size_tokens))]
+    #[pyo3(signature = (dp_rank, used_blocks, total_blocks))]
     fn update_kv_snapshot(
         &self,
-        model: &str,
         dp_rank: u32,
-        expected_dp_ranks: u32,
         used_blocks: u64,
         total_blocks: u64,
-        block_size_tokens: u32,
     ) -> PyResult<()> {
         self.inner
             .update_kv_snapshot(KvCacheSnapshot {
-                model,
                 dp_rank,
-                expected_dp_ranks,
                 used_blocks,
                 total_blocks,
-                block_size_tokens,
             })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }

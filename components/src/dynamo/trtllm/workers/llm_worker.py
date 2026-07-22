@@ -655,7 +655,6 @@ async def init_llm_worker(
         endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.{config.endpoint}"
         )
-        pylon_stats_publisher = endpoint.pylon_stats_publisher()
 
         if shutdown_endpoints is not None:
             shutdown_endpoints[:] = [endpoint]
@@ -710,6 +709,12 @@ async def init_llm_worker(
         # Need to name ADP as `data_parallel_size` for parity with other frameworks
         attention_dp_size = engine.get_attention_dp_size()
         runtime_config.data_parallel_size = attention_dp_size
+        model_name_for_metrics = config.served_model_name or config.model
+        pylon_stats_publisher = endpoint.pylon_stats_publisher(
+            model_name_for_metrics,
+            attention_dp_size,
+            config.kv_block_size,
+        )
 
         # Set topology and KV transfer policy for topology-aware routing
         apply_topology_config(runtime_config)
@@ -818,6 +823,7 @@ async def init_llm_worker(
             conversation_affinity_dp_rank_source=(
                 config.conversation_affinity_dp_rank_source
             ),
+            pylon_stats_publisher=pylon_stats_publisher,
         )
 
         media_decoder = None
@@ -887,8 +893,6 @@ async def init_llm_worker(
         if config.publish_events_and_metrics:
             # Initialize and pass in the publisher to the request handler to
             # publish events and metrics.
-            # Use model as fallback if served_model_name is not provided
-            model_name_for_metrics = config.served_model_name or config.model
             metrics_labels = [
                 (
                     prometheus_names.labels.MODEL,
@@ -934,13 +938,9 @@ async def init_llm_worker(
                 kv_state_endpoint=config.kv_state_endpoint,
                 image_token_id=image_token_id,
                 pylon_stats_publisher=pylon_stats_publisher,
-                pylon_model_name=model_name_for_metrics,
             ) as publisher:
                 handler_config.publisher = publisher
                 handler = RequestHandlerFactory().get_request_handler(handler_config)
-                handler.attach_pylon_stats_publisher(
-                    pylon_stats_publisher, model_name_for_metrics
-                )
                 if config.load_format == "gms":
                     _register_memory_routes(runtime, handler)
 
@@ -963,9 +963,6 @@ async def init_llm_worker(
                 consolidator_publisher.shutdown()
         else:
             handler = RequestHandlerFactory().get_request_handler(handler_config)
-            handler.attach_pylon_stats_publisher(
-                pylon_stats_publisher, model_name_for_metrics
-            )
             if config.load_format == "gms":
                 _register_memory_routes(runtime, handler)
             await endpoint.serve_endpoint(
