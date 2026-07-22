@@ -423,9 +423,9 @@ async def init_llm_worker(
                 f"Using existing event_buffer_max_size={existing} from kv_cache_config"
             )
         else:
-            current_kv_config[
-                "event_buffer_max_size"
-            ] = DEFAULT_KV_EVENT_BUFFER_MAX_SIZE
+            current_kv_config["event_buffer_max_size"] = (
+                DEFAULT_KV_EVENT_BUFFER_MAX_SIZE
+            )
         event_buffer_max_size = int(current_kv_config["event_buffer_max_size"])
 
         # TRT-LLM enables block reuse by default; warn only when it is explicitly
@@ -655,6 +655,7 @@ async def init_llm_worker(
         endpoint = runtime.endpoint(
             f"{config.namespace}.{config.component}.{config.endpoint}"
         )
+        pylon_stats_publisher = endpoint.pylon_stats_publisher()
 
         if shutdown_endpoints is not None:
             shutdown_endpoints[:] = [endpoint]
@@ -932,9 +933,14 @@ async def init_llm_worker(
                 metrics_collector=metrics_collector,
                 kv_state_endpoint=config.kv_state_endpoint,
                 image_token_id=image_token_id,
+                pylon_stats_publisher=pylon_stats_publisher,
+                pylon_model_name=model_name_for_metrics,
             ) as publisher:
                 handler_config.publisher = publisher
                 handler = RequestHandlerFactory().get_request_handler(handler_config)
+                handler.attach_pylon_stats_publisher(
+                    pylon_stats_publisher, model_name_for_metrics
+                )
                 if config.load_format == "gms":
                     _register_memory_routes(runtime, handler)
 
@@ -957,6 +963,9 @@ async def init_llm_worker(
                 consolidator_publisher.shutdown()
         else:
             handler = RequestHandlerFactory().get_request_handler(handler_config)
+            handler.attach_pylon_stats_publisher(
+                pylon_stats_publisher, model_name_for_metrics
+            )
             if config.load_format == "gms":
                 _register_memory_routes(runtime, handler)
             await endpoint.serve_endpoint(

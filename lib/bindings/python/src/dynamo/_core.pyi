@@ -141,12 +141,38 @@ class DistributedRuntime:
         ...
 
 
+class PylonStatsPublisher:
+    """Publishes observed request counters and KV block snapshots to the runtime."""
+
+    def publish_stats_event(
+        self,
+        request_id: str,
+        model: str,
+        tokens_processed: Optional[int] = None,
+        tokens_generated: Optional[int] = None,
+        finished: bool = False,
+    ) -> None: ...
+
+    def update_kv_snapshot(
+        self,
+        model: str,
+        dp_rank: int,
+        expected_dp_ranks: int,
+        used_blocks: int,
+        total_blocks: int,
+        block_size_tokens: int,
+    ) -> None: ...
+
 class Endpoint:
     """
     An Endpoint is a single API endpoint
     """
 
     ...
+
+    def pylon_stats_publisher(self) -> Optional[PylonStatsPublisher]:
+        """Return the local Pylon publisher when the system server is enabled."""
+        ...
 
     async def serve_endpoint(self, handler: RequestHandler, graceful_shutdown: bool = True, metrics_labels: Optional[List[Tuple[str, str]]] = None, health_check_payload: Optional[Dict[str, Any]] = None) -> None:
         """

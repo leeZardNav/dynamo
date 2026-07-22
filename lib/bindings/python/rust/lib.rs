@@ -87,6 +87,7 @@ mod llm;
 mod parsers;
 mod planner;
 mod prometheus_metrics;
+mod pylon_stats;
 mod python_payload;
 
 type PythonServerStreamingIngress = Ingress<
@@ -193,6 +194,7 @@ fn register_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DistributedRuntime>()?;
     m.add_class::<llm::replay::OfflineReplayResult>()?;
     m.add_class::<Endpoint>()?;
+    m.add_class::<pylon_stats::PylonStatsPublisher>()?;
     m.add_class::<ModelCardInstanceId>()?;
     m.add_class::<Client>()?;
     m.add_class::<Instance>()?;
@@ -1343,6 +1345,13 @@ impl DistributedRuntime {
 
 #[pymethods]
 impl Endpoint {
+    /// Return a publisher only when this process exposes the system server.
+    fn pylon_stats_publisher(&self) -> Option<pylon_stats::PylonStatsPublisher> {
+        self.inner.drt().system_status_server_info().map(|_| {
+            pylon_stats::PylonStatsPublisher::attach(self.inner.drt().pylon_stats().clone())
+        })
+    }
+
     #[pyo3(signature = (generator, graceful_shutdown = true, metrics_labels = None, health_check_payload = None))]
     fn serve_endpoint<'p>(
         &self,

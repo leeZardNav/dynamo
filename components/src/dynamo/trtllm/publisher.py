@@ -35,6 +35,7 @@ import msgspec
 import zmq
 from prometheus_client import CollectorRegistry
 
+from dynamo.common.pylon_stats import PylonStatsPublisher
 from dynamo.common.utils.prometheus import LLMBackendMetrics
 from dynamo.llm import FpmDirectPublisher, KvEventPublisher, WorkerMetricsPublisher
 from dynamo.trtllm.utils.request_utils import stored_event_cache_salt
@@ -401,6 +402,8 @@ class Publisher:
         metrics_collector: Any = None,
         kv_state_endpoint: Optional[str] = None,
         image_token_id: Optional[int] = None,
+        pylon_stats_publisher: Optional[PylonStatsPublisher] = None,
+        pylon_model_name: str = "",
     ) -> None:
         self.endpoint = endpoint
         self.engine = engine
@@ -417,6 +420,8 @@ class Publisher:
         self.kv_state_endpoint = kv_state_endpoint
         self.image_token_id = image_token_id
         self.attention_dp_size = engine.get_attention_dp_size()
+        self._pylon_stats_publisher = pylon_stats_publisher
+        self._pylon_model_name = pylon_model_name
 
         # The first few kv events from the model engine are always "created" type events.
         # Use these events to capture the max_window_size of the model.
@@ -434,9 +439,9 @@ class Publisher:
         # the publisher is shut down and None'd. Prevents silent planner poison
         # when running against a TRT-LLM version that predates #13199.
         self._fpm_schema_checked: bool = False
-        self.kv_event_publishers: Optional[
-            Dict[int, KvEventPublisher]
-        ] = None  # One per attention_dp_rank
+        self.kv_event_publishers: Optional[Dict[int, KvEventPublisher]] = (
+            None  # One per attention_dp_rank
+        )
         self.zmq_kv_event_publisher = None  # ZMQ publisher for consolidator
         self.publish_kv_cache_events_thread: Optional[ManagedThread] = None
         self.publish_stats_thread: Optional[ManagedThread] = None
@@ -683,8 +688,10 @@ class Publisher:
             return False
 
         def handle_stat(stat):
-            kv_active_blocks = stat["kvCacheStats"]["usedNumBlocks"]
-            kv_total_blocks = stat["kvCacheStats"]["maxNumBlocks"]
+            kv_cache_stats = stat["kvCacheStats"]
+            kv_active_blocks = int(kv_cache_stats["usedNumBlocks"])
+            kv_total_observed = kv_cache_stats.get("maxNumBlocks")
+            kv_total_blocks = int(kv_total_observed or 0)
             dp_rank = int(stat.get("attentionDpRank", 0))
             logging.debug(f"Publishing stats: kv_active_blocks: {kv_active_blocks}")
             assert self.metrics_publisher is not None
@@ -699,6 +706,24 @@ class Publisher:
                 kv_active_blocks / kv_total_blocks if kv_total_blocks > 0 else 0.0
             )
             self.component_gauges.set_gpu_cache_usage(dp_rank_label, gpu_cache_usage)
+
+            pylon_publisher = self._pylon_stats_publisher
+            if (
+                pylon_publisher is not None
+                and kv_total_observed is not None
+                and kv_total_blocks > 0
+            ):
+                try:
+                    pylon_publisher.update_kv_snapshot(
+                        self._pylon_model_name,
+                        dp_rank,
+                        self.attention_dp_size,
+                        kv_active_blocks,
+                        kv_total_blocks,
+                        self.kv_block_size,
+                    )
+                except (OverflowError, RuntimeError, TypeError, ValueError) as e:
+                    logging.debug("Pylon KV snapshot update rejected: %s", e)
 
             # Log iteration stats to TRT-LLM MetricsCollector (PR #11243)
             # This populates trtllm_kv_cache_hit_rate and trtllm_kv_cache_utilization gauges
@@ -1148,6 +1173,8 @@ async def get_publisher(
     metrics_collector: Any = None,
     kv_state_endpoint: Optional[str] = None,
     image_token_id: Optional[int] = None,
+    pylon_stats_publisher: Optional[PylonStatsPublisher] = None,
+    pylon_model_name: str = "",
 ) -> AsyncGenerator[Publisher, None]:
     publisher = Publisher(
         endpoint,
@@ -1163,6 +1190,8 @@ async def get_publisher(
         metrics_collector=metrics_collector,
         kv_state_endpoint=kv_state_endpoint,
         image_token_id=image_token_id,
+        pylon_stats_publisher=pylon_stats_publisher,
+        pylon_model_name=pylon_model_name,
     )
     try:
         publisher.initialize()
