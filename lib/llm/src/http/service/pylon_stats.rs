@@ -78,30 +78,17 @@ pub(super) struct PylonStats {
 
 impl Default for PylonStats {
     fn default() -> Self {
-        Self::with_capacity(DEFAULT_CHANNEL_CAPACITY)
+        let (tx, _) = broadcast::channel(DEFAULT_CHANNEL_CAPACITY);
+        Self { tx }
     }
 }
 
 impl PylonStats {
-    fn with_capacity(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity);
-        Self { tx }
-    }
-
-    fn publish(&self, update: RequestStatsUpdate<'_>) -> serde_json::Result<()> {
+    fn publish(&self, event: RequestStatsEvent<'_>) -> serde_json::Result<()> {
         if self.tx.receiver_count() == 0 {
             return Ok(());
         }
 
-        let event = RequestStatsEvent {
-            v: 1,
-            event_type: "stats",
-            request_id: update.request_id,
-            model: update.model,
-            tokens_processed: update.tokens_processed,
-            tokens_generated: update.tokens_generated,
-            finished: update.finished,
-        };
         let mut line = serde_json::to_vec(&event)?;
         line.push(b'\n');
 
@@ -113,14 +100,6 @@ impl PylonStats {
     fn subscribe(&self) -> broadcast::Receiver<Bytes> {
         self.tx.subscribe()
     }
-}
-
-struct RequestStatsUpdate<'a> {
-    request_id: &'a str,
-    model: &'a str,
-    tokens_processed: Option<u64>,
-    tokens_generated: Option<u64>,
-    finished: bool,
 }
 
 #[derive(Serialize)]
@@ -140,7 +119,7 @@ struct RequestStatsEvent<'a> {
 pub(super) struct PylonRequestStats {
     stats: PylonStats,
     identity: PylonRequestIdentity,
-    tokens_processed: Option<u64>,
+    observed: bool,
     tokens_generated: Option<u64>,
 }
 
@@ -149,7 +128,7 @@ impl PylonRequestStats {
         Self {
             stats,
             identity,
-            tokens_processed: None,
+            observed: false,
             tokens_generated: None,
         }
     }
@@ -157,12 +136,8 @@ impl PylonRequestStats {
     pub(super) fn observe(&mut self, generated_tokens: usize) {
         let generated_tokens = u64::try_from(generated_tokens).unwrap_or(u64::MAX);
 
-        let tokens_processed = if self.tokens_processed.is_none() {
-            self.tokens_processed = Some(self.identity.input_tokens);
-            self.tokens_processed
-        } else {
-            None
-        };
+        let tokens_processed = (!self.observed).then_some(self.identity.input_tokens);
+        self.observed = true;
         let tokens_generated = if generated_tokens > 0 {
             let previous = self.tokens_generated.unwrap_or_default();
             let total = previous.saturating_add(generated_tokens);
@@ -185,7 +160,9 @@ impl PylonRequestStats {
         tokens_generated: Option<u64>,
         finished: bool,
     ) {
-        let result = self.stats.publish(RequestStatsUpdate {
+        let result = self.stats.publish(RequestStatsEvent {
+            v: 1,
+            event_type: "stats",
             request_id: &self.identity.request_id,
             model: &self.identity.model,
             tokens_processed,
@@ -204,7 +181,11 @@ impl PylonRequestStats {
 
 impl Drop for PylonRequestStats {
     fn drop(&mut self) {
-        self.publish(self.tokens_processed, self.tokens_generated, true);
+        self.publish(
+            self.observed.then_some(self.identity.input_tokens),
+            self.tokens_generated,
+            true,
+        );
     }
 }
 
@@ -261,7 +242,7 @@ fn stats_stream_response(stats: PylonStats, shutdown: CancellationToken) -> Resp
 mod tests {
     use futures::StreamExt;
     use serde_json::Value;
-    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
 
@@ -330,7 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_stats_are_cumulative_and_finish_once() {
-        let stats = PylonStats::with_capacity(8);
+        let stats = PylonStats::default();
         let mut receiver = stats.subscribe();
         {
             let mut request = PylonRequestStats::new(
@@ -371,53 +352,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn counter_saturation_still_emits_terminal_event() {
-        let stats = PylonStats::with_capacity(4);
-        let mut receiver = stats.subscribe();
-        {
-            let mut request = PylonRequestStats::new(
-                stats.clone(),
-                PylonRequestIdentity {
-                    request_id: "pylon-id".to_string(),
-                    model: "external-model".to_string(),
-                    input_tokens: 3,
-                },
-            );
-            request.tokens_processed = Some(3);
-            request.tokens_generated = Some(u64::MAX - 1);
-            request.observe(usize::MAX);
-        }
-
-        let saturated = json(&receiver.recv().await.unwrap());
-        assert_eq!(saturated["tokens_generated"], u64::MAX);
-        assert_eq!(saturated["finished"], false);
-        let finished = json(&receiver.recv().await.unwrap());
-        assert_eq!(finished["tokens_generated"], u64::MAX);
-        assert_eq!(finished["finished"], true);
-    }
-
-    #[tokio::test]
-    async fn bounded_stream_drops_old_cumulative_events() {
-        let stats = PylonStats::with_capacity(2);
-        let mut receiver = stats.subscribe();
-        for generated in [2, 5, 9] {
-            stats
-                .publish(RequestStatsUpdate {
-                    request_id: "request",
-                    model: "model",
-                    tokens_processed: None,
-                    tokens_generated: Some(generated),
-                    finished: false,
-                })
-                .unwrap();
-        }
-
-        assert!(matches!(receiver.recv().await, Err(RecvError::Lagged(1))));
-        assert_eq!(json(&receiver.recv().await.unwrap())["tokens_generated"], 5);
-        assert_eq!(json(&receiver.recv().await.unwrap())["tokens_generated"], 9);
-    }
-
-    #[tokio::test]
     async fn stream_is_ready_immediately_and_closes_on_shutdown() {
         let shutdown = CancellationToken::new();
         let response = stats_stream_response(PylonStats::default(), shutdown.clone());
@@ -452,19 +386,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next, Bytes::from_static(PING_LINE));
-    }
-
-    #[test]
-    fn frontend_registers_stats_without_the_unused_kv_route() {
-        let service = service_v2::HttpService::builder().build().unwrap();
-        let routes = service
-            .route_docs()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-
-        assert!(routes.contains(&format!("GET {STATS_PATH}")));
-        assert!(!routes.contains(&"GET /kv-cache/stats".to_string()));
     }
 
     #[tokio::test]

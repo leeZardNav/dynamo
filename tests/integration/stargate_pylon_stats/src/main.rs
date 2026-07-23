@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail, ensure};
@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, timeout};
 
@@ -39,16 +39,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const WHOLE_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CHUNK_DELAY: Duration = Duration::from_millis(100);
-const METRIC_CONNECTED: &str = "pylon_engine_stats_stream_connected";
-const METRIC_EVENTS: &str = "pylon_engine_stats_stream_events_total";
+const METRIC_CONNECTED_REQUIRED: &str = r#"pylon_engine_stats_stream_connected{mode="required"}"#;
+const METRIC_EVENT_PING: &str = r#"pylon_engine_stats_stream_events_total{type="ping"}"#;
+const METRIC_EVENT_STATS: &str = r#"pylon_engine_stats_stream_events_total{type="stats"}"#;
 const METRIC_RECONNECTS: &str = "pylon_engine_stats_stream_reconnects_total";
+const METRIC_RECONNECT_CONNECT_ERROR: &str =
+    r#"pylon_engine_stats_stream_reconnects_total{reason="connect_error"}"#;
 const METRIC_INVALID: &str = "pylon_engine_stats_stream_invalid_events_total";
-const METRIC_LIVE: &str = "pylon_engine_stats_live_requests";
-const METRIC_STATS_SOURCE: &str = "pylon_model_stats_source";
-const METRIC_STATS_CAPABILITY: &str = "pylon_model_stats_capability";
-const METRIC_INPUT_TPS: &str = "pylon_model_last_mean_input_tps";
-const METRIC_OUTPUT_TPS: &str = "pylon_model_output_tps";
-const METRIC_MAX_OUTPUT_TPS: &str = "pylon_model_max_output_tps";
+const METRIC_LIVE_ENGINE_STATS: &str =
+    r#"pylon_engine_stats_live_requests{source="engine_stats_stream"}"#;
+const METRIC_STATS_SOURCE_ENGINE: &str =
+    r#"pylon_model_stats_source{model="pylon-e2e",source="engine_stats_stream"}"#;
+const METRIC_STATS_CAPABILITY_ENGINE: &str = r#"pylon_model_stats_capability{capability="model.throughput.engine_stream",model="pylon-e2e"}"#;
+const METRIC_INPUT_TPS: &str = r#"pylon_model_last_mean_input_tps{model="pylon-e2e"}"#;
+const METRIC_OUTPUT_TPS: &str = r#"pylon_model_output_tps{model="pylon-e2e"}"#;
+const METRIC_MAX_OUTPUT_TPS: &str = r#"pylon_model_max_output_tps{model="pylon-e2e"}"#;
 const METRIC_REGISTRATION_CONNECTED: &str = "pylon_registration_stream_connected";
 
 #[derive(Debug)]
@@ -56,8 +61,6 @@ struct Args {
     pylon_bin: PathBuf,
     stargate_probe_bin: PathBuf,
     artifact_dir: PathBuf,
-    dynamo_sha: String,
-    stargate_sha: String,
 }
 
 impl Args {
@@ -66,8 +69,6 @@ impl Args {
         let mut pylon_bin = None;
         let mut stargate_probe_bin = None;
         let mut artifact_dir = None;
-        let mut dynamo_sha = None;
-        let mut stargate_sha = None;
         while let Some(argument) = values.next() {
             let argument = argument.to_string_lossy();
             let mut value = || {
@@ -79,8 +80,6 @@ impl Args {
                 "--pylon-bin" => pylon_bin = Some(PathBuf::from(value()?)),
                 "--stargate-probe-bin" => stargate_probe_bin = Some(PathBuf::from(value()?)),
                 "--artifact-dir" => artifact_dir = Some(PathBuf::from(value()?)),
-                "--dynamo-sha" => dynamo_sha = Some(value()?.to_string_lossy().into_owned()),
-                "--stargate-sha" => stargate_sha = Some(value()?.to_string_lossy().into_owned()),
                 other => bail!("unknown argument: {other}"),
             }
         }
@@ -88,8 +87,6 @@ impl Args {
             pylon_bin: pylon_bin.context("--pylon-bin is required")?,
             stargate_probe_bin: stargate_probe_bin.context("--stargate-probe-bin is required")?,
             artifact_dir: artifact_dir.context("--artifact-dir is required")?,
-            dynamo_sha: dynamo_sha.context("--dynamo-sha is required")?,
-            stargate_sha: stargate_sha.context("--stargate-sha is required")?,
         })
     }
 }
@@ -403,8 +400,7 @@ struct StargateSnapshot {
 struct PylonProcess {
     child: Child,
     metrics_addr: SocketAddr,
-    ring: Arc<Mutex<VecDeque<String>>>,
-    log_tasks: Vec<JoinHandle<Result<()>>>,
+    log_path: PathBuf,
 }
 
 async fn wait_for_child_tcp_listener(child: &mut Child, deadline: Duration) -> Result<SocketAddr> {
@@ -544,6 +540,12 @@ impl PylonProcess {
             ),
         )
         .await?;
+        let stdout = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&log_path)?;
+        let stderr = stdout.try_clone()?;
         let mut command = Command::new(pylon_bin);
         command
             .args(&arguments)
@@ -551,29 +553,14 @@ impl PylonProcess {
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
             )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
             .kill_on_drop(true);
-        let mut child = command.spawn().context("failed to spawn Pylon")?;
-        let stdout = child.stdout.take().context("Pylon stdout was not piped")?;
-        let stderr = child.stderr.take().context("Pylon stderr was not piped")?;
-        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(200)));
-        let file = Arc::new(AsyncMutex::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .await?,
-        ));
-        let log_tasks = vec![
-            tokio::spawn(pump_logs("stdout", stdout, file.clone(), ring.clone())),
-            tokio::spawn(pump_logs("stderr", stderr, file, ring.clone())),
-        ];
+        let child = command.spawn().context("failed to spawn Pylon")?;
         let mut process = Self {
             child,
             metrics_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            ring,
-            log_tasks,
+            log_path,
         };
         let startup = async {
             process.metrics_addr =
@@ -645,69 +632,23 @@ impl PylonProcess {
                 bail!("Pylon did not stop within the shutdown timeout");
             }
         }
-        for task in self.log_tasks.drain(..) {
-            match timeout(Duration::from_secs(1), task).await {
-                Ok(Ok(result)) => result?,
-                Ok(Err(error)) => return Err(error.into()),
-                Err(_) => {}
-            }
-        }
         Ok(())
     }
 
     async fn force_stop(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-        for task in self.log_tasks.drain(..) {
-            task.abort();
-        }
     }
 
     fn last_logs(&self) -> String {
-        self.ring
-            .lock()
-            .expect("Pylon log ring poisoned")
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+        std::fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 }
 
 impl Drop for PylonProcess {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        for task in &self.log_tasks {
-            task.abort();
-        }
     }
-}
-
-async fn pump_logs<R>(
-    source: &'static str,
-    reader: R,
-    file: Arc<AsyncMutex<File>>,
-    ring: Arc<Mutex<VecDeque<String>>>,
-) -> Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
-        let labeled = format!("[{source}] {line}");
-        {
-            let mut ring = ring.lock().expect("Pylon log ring poisoned");
-            if ring.len() == 200 {
-                ring.pop_front();
-            }
-            ring.push_back(labeled.clone());
-        }
-        let mut file = file.lock().await;
-        file.write_all(labeled.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-    }
-    Ok(())
 }
 
 fn shell_quote(value: &str) -> String {
@@ -870,10 +811,7 @@ impl DiagnosticStream {
                 expected.len() * 4
             );
         }
-        Ok(CollectedBatch {
-            event_count,
-            request_count: expected.len(),
-        })
+        Ok(CollectedBatch { event_count })
     }
 }
 
@@ -1020,134 +958,74 @@ struct RequestSpec {
 #[derive(Clone, Debug, Serialize)]
 struct CollectedBatch {
     event_count: usize,
-    request_count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct PrometheusSnapshot {
     text: String,
-    samples: Vec<MetricSample>,
-}
-
-#[derive(Clone, Debug)]
-struct MetricSample {
-    name: String,
-    labels: HashMap<String, String>,
-    value: f64,
 }
 
 impl PrometheusSnapshot {
     fn parse(text: String) -> Result<Self> {
-        let mut samples = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        for line in metric_lines(&text) {
+            parse_metric_sample(line)?;
+        }
+        Ok(Self { text })
+    }
+
+    fn value(&self, descriptor: &str) -> Result<f64> {
+        let mut found = None;
+        for line in metric_lines(&self.text) {
+            let (candidate, value) = parse_metric_sample(line)?;
+            if candidate == descriptor {
+                ensure!(
+                    found.replace(value).is_none(),
+                    "duplicate Prometheus sample: {descriptor}"
+                );
             }
-            let (descriptor, value) = line
-                .split_once(char::is_whitespace)
-                .with_context(|| format!("malformed Prometheus line: {line}"))?;
-            let value = value
-                .split_whitespace()
-                .next()
-                .context("missing Prometheus value")?
-                .parse::<f64>()
-                .with_context(|| format!("invalid Prometheus value in {line}"))?;
-            let (name, labels) = parse_metric_descriptor(descriptor)?;
-            samples.push(MetricSample {
-                name,
-                labels,
-                value,
-            });
         }
-        Ok(Self { text, samples })
+        Ok(found.unwrap_or_default())
     }
 
-    fn value(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
-        self.samples
-            .iter()
-            .find(|sample| {
-                sample.name == name
-                    && labels.iter().all(|(key, value)| {
-                        sample.labels.get(*key).map(String::as_str) == Some(*value)
-                    })
-            })
-            .map(|sample| sample.value)
-    }
-
-    fn value_or_zero(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
-        self.value(name, labels).unwrap_or_default()
-    }
-
-    fn sum(&self, name: &str) -> f64 {
-        self.samples
-            .iter()
-            .filter(|sample| sample.name == name)
-            .map(|sample| sample.value)
-            .sum()
-    }
-
-    fn any_value(&self, name: &str, value: f64) -> bool {
-        self.samples
-            .iter()
-            .any(|sample| sample.name == name && sample.value == value)
+    fn family_sum(&self, name: &str) -> Result<f64> {
+        let mut total = 0.0;
+        for line in metric_lines(&self.text) {
+            let (descriptor, value) = parse_metric_sample(line)?;
+            if descriptor == name
+                || descriptor
+                    .strip_prefix(name)
+                    .is_some_and(|labels| labels.starts_with('{'))
+            {
+                total += value;
+            }
+        }
+        Ok(total)
     }
 }
 
-fn parse_metric_descriptor(descriptor: &str) -> Result<(String, HashMap<String, String>)> {
-    let Some(open) = descriptor.find('{') else {
-        return Ok((descriptor.to_string(), HashMap::new()));
-    };
-    ensure!(
-        descriptor.ends_with('}'),
-        "malformed metric descriptor: {descriptor}"
-    );
-    let name = descriptor[..open].to_string();
-    let mut labels = HashMap::new();
-    let mut rest = &descriptor[open + 1..descriptor.len() - 1];
-    while !rest.is_empty() {
-        let equals = rest
-            .find('=')
-            .with_context(|| format!("malformed metric labels: {descriptor}"))?;
-        let key = &rest[..equals];
-        rest = &rest[equals + 1..];
-        ensure!(rest.starts_with('"'), "unquoted metric label: {descriptor}");
-        let (value, consumed) = parse_quoted_label(rest)?;
-        labels.insert(key.to_string(), value);
-        rest = &rest[consumed..];
-        if rest.is_empty() {
-            break;
-        }
+fn metric_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+}
+
+fn parse_metric_sample(line: &str) -> Result<(&str, f64)> {
+    let (descriptor, value) = line
+        .split_once(char::is_whitespace)
+        .with_context(|| format!("malformed Prometheus line: {line}"))?;
+    if descriptor.contains('{') {
         ensure!(
-            rest.starts_with(','),
-            "malformed metric separator: {descriptor}"
+            descriptor.ends_with('}'),
+            "malformed Prometheus descriptor: {descriptor}"
         );
-        rest = &rest[1..];
     }
-    Ok((name, labels))
-}
-
-fn parse_quoted_label(value: &str) -> Result<(String, usize)> {
-    let mut output = String::new();
-    let mut escaped = false;
-    for (offset, character) in value[1..].char_indices() {
-        if escaped {
-            output.push(match character {
-                'n' => '\n',
-                '\\' => '\\',
-                '"' => '"',
-                other => other,
-            });
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if character == '"' {
-            return Ok((output, offset + 2));
-        } else {
-            output.push(character);
-        }
-    }
-    bail!("unterminated metric label: {value}")
+    let value = value
+        .split_whitespace()
+        .next()
+        .context("missing Prometheus value")?
+        .parse::<f64>()
+        .with_context(|| format!("invalid Prometheus value in {line}"))?;
+    Ok((descriptor, value))
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1177,16 +1055,10 @@ struct BatchReport {
 
 #[derive(Debug, Serialize)]
 struct TestReport {
-    status: &'static str,
-    dynamo_sha: String,
-    stargate_sha: String,
     total_duration_ms: u128,
     phases: Vec<PhaseReport>,
     batches: Vec<BatchReport>,
     reconnect_count: u64,
-    final_candidate: CandidateReport,
-    pylon_logs: Vec<String>,
-    raw_ndjson: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1284,26 +1156,22 @@ async fn run(args: &Args) -> Result<TestReport> {
                 &mut pylon,
                 READY_TIMEOUT,
                 |metrics| {
-                    let reconnects = metric_u64(
-                        metrics.value_or_zero(METRIC_RECONNECTS, &[("reason", "connect_error")]),
-                        METRIC_RECONNECTS,
-                    )?;
-                    let connected =
-                        metrics.value_or_zero(METRIC_CONNECTED, &[("mode", "required")]);
+                    let reconnects = metric_counter(metrics, METRIC_RECONNECT_CONNECT_ERROR)?;
+                    let connected = metrics.value(METRIC_CONNECTED_REQUIRED)?;
                     Ok((reconnects >= 2 && connected == 0.0).then_some(metrics.clone()))
                 },
                 "two Pylon connect_error retries while disconnected",
             )
             .await?;
             ensure!(
-                snapshot.value_or_zero(METRIC_CONNECTED, &[("mode", "required")]) == 0.0,
+                snapshot.value(METRIC_CONNECTED_REQUIRED)? == 0.0,
                 "Pylon unexpectedly connected before Dynamo started"
             );
             Ok(pylon)
         })
         .await?;
 
-    let ping_before = metric_counter(&pylon.scrape().await?, METRIC_EVENTS, &[("type", "ping")])?;
+    let ping_before = metric_counter(&pylon.scrape().await?, METRIC_EVENT_PING)?;
     let dynamo = report
         .phase("late-dynamo-start", DynamoFixture::start(reservation))
         .await?;
@@ -1384,13 +1252,9 @@ async fn run(args: &Args) -> Result<TestReport> {
     for cycle in 1..=3 {
         drop(diagnostic);
         let metrics_before_restart = pylon.scrape().await?;
-        let reconnect_before = metric_counter(
-            &metrics_before_restart,
-            METRIC_RECONNECTS,
-            &[("reason", "connect_error")],
-        )?;
-        let ping_before =
-            metric_counter(&metrics_before_restart, METRIC_EVENTS, &[("type", "ping")])?;
+        let reconnect_before =
+            metric_counter(&metrics_before_restart, METRIC_RECONNECT_CONNECT_ERROR)?;
+        let ping_before = metric_counter(&metrics_before_restart, METRIC_EVENT_PING)?;
         reservation = report
             .phase(&format!("dynamo-stop-{cycle}"), dynamo.stop_and_reserve())
             .await?;
@@ -1398,9 +1262,8 @@ async fn run(args: &Args) -> Result<TestReport> {
             &mut pylon,
             READY_TIMEOUT,
             |metrics| {
-                let connected = metrics.value_or_zero(METRIC_CONNECTED, &[("mode", "required")]);
-                let reconnects =
-                    metric_counter(metrics, METRIC_RECONNECTS, &[("reason", "connect_error")])?;
+                let connected = metrics.value(METRIC_CONNECTED_REQUIRED)?;
+                let reconnects = metric_counter(metrics, METRIC_RECONNECT_CONNECT_ERROR)?;
                 Ok((connected == 0.0 && reconnects > reconnect_before).then_some(metrics.clone()))
             },
             "Pylon disconnect and connect_error retry",
@@ -1479,7 +1342,6 @@ async fn run(args: &Args) -> Result<TestReport> {
         previous_timestamp,
     )
     .await?;
-    let final_candidate = batch.candidate.clone();
     report.batches.push(batch);
 
     let final_metrics = pylon.scrape().await?;
@@ -1499,19 +1361,12 @@ async fn run(args: &Args) -> Result<TestReport> {
             stargate.shutdown().await
         })
         .await?;
-    let pylon_logs = pylon_log_paths(&args.artifact_dir).await?;
 
     Ok(TestReport {
-        status: "passed",
-        dynamo_sha: args.dynamo_sha.clone(),
-        stargate_sha: args.stargate_sha.clone(),
         total_duration_ms: report.started_at.elapsed().as_millis(),
         phases: report.phases,
         batches: report.batches,
         reconnect_count,
-        final_candidate,
-        pylon_logs,
-        raw_ndjson: raw_path.display().to_string(),
     })
 }
 
@@ -1526,12 +1381,12 @@ async fn run_batch(
 ) -> Result<BatchReport> {
     let started = Instant::now();
     let baseline = wait_pylon_live_zero(pylon).await?;
-    let event_baseline = metric_counter(&baseline, METRIC_EVENTS, &[("type", "stats")])?;
+    let event_baseline = metric_counter(&baseline, METRIC_EVENT_STATS)?;
     let invalid_baseline = metric_counter_sum(&baseline, METRIC_INVALID)?;
     let model_stats_baseline = (
-        baseline.value_or_zero(METRIC_INPUT_TPS, &[("model", MODEL)]),
-        baseline.value_or_zero(METRIC_OUTPUT_TPS, &[("model", MODEL)]),
-        baseline.value_or_zero(METRIC_MAX_OUTPUT_TPS, &[("model", MODEL)]),
+        baseline.value(METRIC_INPUT_TPS)?,
+        baseline.value(METRIC_OUTPUT_TPS)?,
+        baseline.value(METRIC_MAX_OUTPUT_TPS)?,
     );
 
     let client = reqwest::Client::new();
@@ -1549,7 +1404,7 @@ async fn run_batch(
         pylon,
         READY_TIMEOUT,
         |metrics| {
-            let current = metric_counter(metrics, METRIC_EVENTS, &[("type", "stats")])?;
+            let current = metric_counter(metrics, METRIC_EVENT_STATS)?;
             let delta = current
                 .checked_sub(event_baseline)
                 .context("Pylon stats counter regressed")?;
@@ -1577,9 +1432,9 @@ async fn run_batch(
     Ok(BatchReport {
         name: name.to_string(),
         duration_ms: started.elapsed().as_millis(),
-        request_count: collected.request_count,
+        request_count: requests.len(),
         event_count: collected.event_count,
-        pylon_stats_event_total: metric_counter(&parsed, METRIC_EVENTS, &[("type", "stats")])?,
+        pylon_stats_event_total: metric_counter(&parsed, METRIC_EVENT_STATS)?,
         pylon_invalid_event_total: metric_counter_sum(&parsed, METRIC_INVALID)?,
         candidate,
     })
@@ -1637,8 +1492,8 @@ async fn wait_for_pylon_stream(pylon: &mut PylonProcess, ping_before: u64) -> Re
         pylon,
         READY_TIMEOUT,
         |metrics| {
-            let connected = metrics.value_or_zero(METRIC_CONNECTED, &[("mode", "required")]);
-            let ping = metric_counter(metrics, METRIC_EVENTS, &[("type", "ping")])?;
+            let connected = metrics.value(METRIC_CONNECTED_REQUIRED)?;
+            let ping = metric_counter(metrics, METRIC_EVENT_PING)?;
             Ok((connected == 1.0 && ping > ping_before).then_some(metrics.clone()))
         },
         "Pylon stats stream connection and immediate ping",
@@ -1655,8 +1510,7 @@ async fn wait_for_registration_and_route(
         pylon,
         READY_TIMEOUT,
         |metrics| {
-            Ok(metrics
-                .any_value(METRIC_REGISTRATION_CONNECTED, 1.0)
+            Ok((metrics.family_sum(METRIC_REGISTRATION_CONNECTED)? > 0.0)
                 .then_some(metrics.clone()))
         },
         "Pylon registration stream",
@@ -1691,7 +1545,7 @@ async fn wait_pylon_live_zero(pylon: &mut PylonProcess) -> Result<PrometheusSnap
         pylon,
         READY_TIMEOUT,
         |metrics| {
-            let live = metrics.value_or_zero(METRIC_LIVE, &[("source", "engine_stats_stream")]);
+            let live = metrics.value(METRIC_LIVE_ENGINE_STATS)?;
             Ok((live == 0.0).then_some(metrics.clone()))
         },
         "Pylon live request count to reach zero",
@@ -1718,20 +1572,11 @@ async fn wait_for_model_stats(
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
         }
-        let source = metrics.value_or_zero(
-            METRIC_STATS_SOURCE,
-            &[("model", MODEL), ("source", "engine_stats_stream")],
-        );
-        let capability = metrics.value_or_zero(
-            METRIC_STATS_CAPABILITY,
-            &[
-                ("model", MODEL),
-                ("capability", "model.throughput.engine_stream"),
-            ],
-        );
-        let input_tps = metrics.value_or_zero(METRIC_INPUT_TPS, &[("model", MODEL)]);
-        let output_tps = metrics.value_or_zero(METRIC_OUTPUT_TPS, &[("model", MODEL)]);
-        let max_output_tps = metrics.value_or_zero(METRIC_MAX_OUTPUT_TPS, &[("model", MODEL)]);
+        let source = metrics.value(METRIC_STATS_SOURCE_ENGINE)?;
+        let capability = metrics.value(METRIC_STATS_CAPABILITY_ENGINE)?;
+        let input_tps = metrics.value(METRIC_INPUT_TPS)?;
+        let output_tps = metrics.value(METRIC_OUTPUT_TPS)?;
+        let max_output_tps = metrics.value(METRIC_MAX_OUTPUT_TPS)?;
         let model_stats_changed = [
             (input_tps, model_stats_baseline.0),
             (output_tps, model_stats_baseline.1),
@@ -1838,16 +1683,12 @@ async fn wait_http_ok(url: &str, deadline: Duration) -> Result<()> {
     .await
 }
 
-fn metric_counter(
-    snapshot: &PrometheusSnapshot,
-    name: &str,
-    labels: &[(&str, &str)],
-) -> Result<u64> {
-    metric_u64(snapshot.value_or_zero(name, labels), name)
+fn metric_counter(snapshot: &PrometheusSnapshot, descriptor: &str) -> Result<u64> {
+    metric_u64(snapshot.value(descriptor)?, descriptor)
 }
 
 fn metric_counter_sum(snapshot: &PrometheusSnapshot, name: &str) -> Result<u64> {
-    metric_u64(snapshot.sum(name), name)
+    metric_u64(snapshot.family_sum(name)?, name)
 }
 
 fn metric_u64(value: f64, name: &str) -> Result<u64> {
@@ -1856,20 +1697,6 @@ fn metric_u64(value: f64, name: &str) -> Result<u64> {
         "{name} is not a nonnegative integer: {value}"
     );
     u64::try_from(value as u128).with_context(|| format!("{name} is too large: {value}"))
-}
-
-async fn pylon_log_paths(artifact_dir: &Path) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    let mut entries = tokio::fs::read_dir(artifact_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with("pylon-") && name.ends_with(".log") {
-            paths.push(entry.path().display().to_string());
-        }
-    }
-    paths.sort();
-    Ok(paths)
 }
 
 async fn signal_interrupt(child: &mut Child, label: &str) -> Result<()> {

@@ -128,16 +128,7 @@ build_root="$dynamo_root/target/stargate-pylon-e2e/build"
 pylon_target="$build_root/pylon-target"
 probe_root="$build_root/stargate-probe"
 probe_target="$build_root/stargate-probe-target"
-harness_root="$build_root/harness"
-harness_target="$build_root/harness-target"
-mkdir -p "$probe_root" "$harness_root"
-
-manifest="$harness_root/Cargo.toml"
-harness_source="$script_dir/src/main.rs"
-sed \
-    -e "s|@DYNAMO_ROOT@|$dynamo_root|g" \
-    -e "s|@HARNESS_SOURCE@|$harness_source|g" \
-    "$script_dir/Cargo.toml.in" > "$manifest"
+mkdir -p "$probe_root"
 
 probe_manifest="$probe_root/Cargo.toml"
 probe_source="$script_dir/src/stargate_probe.rs"
@@ -145,13 +136,6 @@ sed \
     -e "s|@STARGATE_ROOT@|$stargate_root|g" \
     -e "s|@PROBE_SOURCE@|$probe_source|g" \
     "$script_dir/StargateProbe.Cargo.toml.in" > "$probe_manifest"
-
-if [[ -z "${LIBCLANG_PATH:-}" && -d /tmp/codex-libclang/clang/native ]]; then
-    export LIBCLANG_PATH=/tmp/codex-libclang/clang/native
-fi
-if [[ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" && -d /usr/lib/gcc/x86_64-linux-gnu/11/include ]]; then
-    export BINDGEN_EXTRA_CLANG_ARGS="-isystem /usr/lib/gcc/x86_64-linux-gnu/11/include -isystem /usr/include/x86_64-linux-gnu -isystem /usr/include"
-fi
 
 printf 'Building NVCF Pylon from %s\n' "$stargate_root"
 cargo build \
@@ -176,32 +160,18 @@ cargo build \
     --manifest-path "$probe_manifest" \
     --target-dir "$probe_target"
 
-printf 'Resolving E2E harness dependencies\n'
-cp "$dynamo_root/Cargo.lock" "$harness_root/Cargo.lock"
-cargo metadata \
-    --manifest-path "$manifest" \
-    --format-version 1 \
-    > /dev/null
-verify_generated_lock \
-    "$dynamo_root/Cargo.lock" \
-    "$harness_root/Cargo.lock" \
-    "E2E harness"
-cp "$harness_root/Cargo.lock" "$artifact_dir/harness-Cargo.lock"
-
 pylon_bin="$pylon_target/debug/pylon"
 stargate_probe_bin="$probe_target/debug/stargate-state-probe"
 printf 'Running E2E harness; artifacts: %s\n' "$artifact_dir"
 set +e
 cargo run \
     --locked \
-    --manifest-path "$manifest" \
-    --target-dir "$harness_target" \
+    --manifest-path "$dynamo_root/Cargo.toml" \
+    -p stargate-pylon-stats-e2e \
     -- \
     --pylon-bin "$pylon_bin" \
     --stargate-probe-bin "$stargate_probe_bin" \
     --artifact-dir "$artifact_dir" \
-    --dynamo-sha "$dynamo_sha" \
-    --stargate-sha "$stargate_sha" \
     2>&1 | tee "$artifact_dir/harness.log"
 status=${PIPESTATUS[0]}
 set -e
