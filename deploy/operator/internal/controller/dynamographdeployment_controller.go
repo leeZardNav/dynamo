@@ -29,7 +29,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -74,7 +73,6 @@ type DynamoGraphDeploymentReconciler struct {
 	RestConfig            *rest.Config
 	Recorder              events.EventRecorder
 	DockerSecretRetriever dockerSecretRetriever
-	ScaleClient           scale.ScalesGetter
 	SSHKeyManager         *secret.SSHKeyManager
 	RBACManager           rbacManager
 }
