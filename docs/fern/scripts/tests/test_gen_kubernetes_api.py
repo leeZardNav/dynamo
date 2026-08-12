@@ -45,7 +45,7 @@ EXPECTED_PACKAGES = (
 )
 EXPECTED_TYPE_COUNTS = {
     "nvidia.com/v1alpha1": 83,
-    "nvidia.com/v1beta1": 66,
+    "nvidia.com/v1beta1": 67,
     "operator.config.dynamo.nvidia.com/v1alpha1": 32,
 }
 EXPECTED_OPERATOR_DEFAULT_SECTIONS = (
@@ -121,7 +121,7 @@ def test_each_package_type_count_matches_the_baseline(
     package_name: str,
     expected: int,
 ) -> None:
-    """The compact index pins the exact per-package type counts (83 / 66 /
+    """The compact index pins the exact per-package type counts (83 / 67 /
     32). Any drift from the tracked upstream API surface is a scope change
     and must be reviewed as one."""
     by_name = {pkg.name: pkg for pkg in reference.packages}
