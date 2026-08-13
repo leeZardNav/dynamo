@@ -47,7 +47,7 @@ func newGroveWorkloadsReconciler(
 	recorder events.EventRecorder,
 	config *configv1alpha1.OperatorConfiguration,
 	runtimeConfig *commoncontroller.RuntimeConfig,
-	dockerSecretRetriever dockerSecretRetriever,
+	dockerSecretRetriever DockerSecretRetriever,
 ) *groveWorkloadsReconciler {
 	return &groveWorkloadsReconciler{
 		syncer: newDGDResourceSyncer(kubeClient, recorder),
