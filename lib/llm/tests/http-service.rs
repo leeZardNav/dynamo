@@ -6,6 +6,7 @@ use async_stream::stream;
 use dynamo_llm::protocols::{
     Annotated,
     codec::SseLineCodec,
+    common::extensions::NvExt,
     convert_sse_stream,
     openai::{
         chat_completions::{NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse},
@@ -42,6 +43,21 @@ mod ports;
 use ports::bind_random_port;
 
 struct CounterEngine {}
+
+#[derive(Default)]
+struct NvExtCaptureEngine {
+    nvext: std::sync::Mutex<Option<Option<NvExt>>>,
+}
+
+impl NvExtCaptureEngine {
+    fn take_nvext(&self) -> Option<NvExt> {
+        self.nvext
+            .lock()
+            .unwrap()
+            .take()
+            .expect("engine did not receive a request")
+    }
+}
 
 struct FirstTokenGateEngine {
     release: Arc<tokio::sync::Notify>,
@@ -132,6 +148,23 @@ impl
         };
 
         Ok(ResponseStream::new(Box::pin(stream), ctx))
+    }
+}
+
+#[async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateChatCompletionRequest>,
+        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+        Error,
+    > for NvExtCaptureEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+        self.nvext.lock().unwrap().replace(request.nvext.clone());
+        CounterEngine {}.generate(request).await
     }
 }
 
@@ -1470,8 +1503,8 @@ async fn test_model_ready_endpoint_non_displayable_shadow() {
     task.await.unwrap().unwrap();
 }
 
-/// With nvext disabled, a request asking for response `extra_fields` must not
-/// produce any `nvext` field in the response.
+/// With nvext disabled, cache salting reaches the engine while all other NvExt
+/// behavior stays disabled, including response `extra_fields`.
 #[tokio::test]
 async fn test_nvext_disabled_strips_request_and_response() {
     dynamo_runtime::logging::init();
@@ -1492,19 +1525,24 @@ async fn test_nvext_disabled_strips_request_and_response() {
     wait_for_service_ready(port).await;
 
     let card = ModelDeploymentCard::with_name_only("test-model");
+    let engine = Arc::new(NvExtCaptureEngine::default());
     manager
-        .add_chat_completions_model("test-model", card.mdcsum(), Arc::new(CounterEngine {}))
+        .add_chat_completions_model("test-model", card.mdcsum(), engine.clone())
         .unwrap();
 
     let response = reqwest::Client::new()
         .post(format!("http://localhost:{port}/v1/chat/completions"))
         .header("x-dynamo-worker-instance-id", "42")
+        .header("x-dynamo-dp-rank", "3")
+        .header("x-dynamo-request-priority", "7")
+        .header("x-tenant-id", "tenant-header")
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": true,
             "max_tokens": 1,
             "nvext": {
+                "cache_salt": "tenant-body",
                 "extra_fields": ["worker_id", "timing", "engine_data"],
                 "backend_instance_id": 99
             }
@@ -1515,6 +1553,11 @@ async fn test_nvext_disabled_strips_request_and_response() {
     assert!(response.status().is_success());
 
     let body = response.text().await.expect("read body");
+    let nvext = engine
+        .take_nvext()
+        .expect("cache salt must reach the engine");
+    assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-header"));
+    assert!(!nvext.has_non_cache_salt_fields());
     assert!(
         !body.contains("\"nvext\""),
         "nvext gate off: response must not contain an `nvext` field, got: {body}"
