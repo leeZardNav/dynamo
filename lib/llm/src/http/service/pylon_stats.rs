@@ -136,15 +136,16 @@ impl PylonRequestStats {
     pub(super) fn observe(&mut self, generated_tokens: usize) {
         let generated_tokens = u64::try_from(generated_tokens).unwrap_or(u64::MAX);
 
+        // A response observation means input processing completed, even when it
+        // contains no generated tokens.
         let tokens_processed = (!self.observed).then_some(self.identity.input_tokens);
         self.observed = true;
         let tokens_generated = if generated_tokens > 0 {
             let previous = self.tokens_generated.unwrap_or_default();
             let total = previous.saturating_add(generated_tokens);
-            (total > previous).then(|| {
-                self.tokens_generated = Some(total);
-                total
-            })
+            self.tokens_generated = Some(total);
+            // Equality means the counter saturated; do not publish a non-increasing total.
+            (total > previous).then_some(total)
         } else {
             None
         };
@@ -348,6 +349,28 @@ mod tests {
         assert_eq!(finished["tokens_processed"], 3);
         assert_eq!(finished["tokens_generated"], 5);
         assert_eq!(finished["finished"], true);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn unobserved_request_finishes_without_counters() {
+        let stats = PylonStats::default();
+        let mut receiver = stats.subscribe();
+        let request = PylonRequestStats::new(
+            stats.clone(),
+            PylonRequestIdentity {
+                request_id: "pylon-id".to_string(),
+                model: "external-model".to_string(),
+                input_tokens: 3,
+            },
+        );
+
+        drop(request);
+
+        let finished = json(&receiver.recv().await.unwrap());
+        assert_eq!(finished["finished"], true);
+        assert!(finished.get("tokens_processed").is_none());
+        assert!(finished.get("tokens_generated").is_none());
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 
