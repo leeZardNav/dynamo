@@ -378,11 +378,7 @@ The hash is computed from a SHA-256 digest of all worker service specs (excludin
 - Pod template changes (image, resources, env vars, volumes, etc.) **do** trigger a rolling update.
 - The hash covers **all** worker services together — changing any single worker's spec triggers a rolling update for all workers.
 
-The current v2 worker hash is stored as the annotation `nvidia.com/current-worker-hash-v2` on the
-DGD resource, and individual worker DCDs are labeled with `nvidia.com/dynamo-worker-hash` for
-filtering. DGDs migrated from older releases can also retain `nvidia.com/current-worker-hash` as the
-suffix of an active v1-named DCD. See [Worker Hash Semantics](worker-hash-semantics.md) for the
-versioned hash and migration contract.
+The current worker hash is stored as the annotation `nvidia.com/current-worker-hash` on the DGD resource, and individual worker DCDs are labeled with `nvidia.com/dynamo-worker-hash` for filtering.
 
 ### Status During Rolling Updates
 

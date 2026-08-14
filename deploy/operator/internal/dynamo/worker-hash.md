@@ -1,9 +1,9 @@
----
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-title: Worker Hash Semantics
-subtitle: Versioned worker hashes, rollout decisions, and the v1-to-v2 migration contract in the Dynamo Operator
----
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Worker Hash Semantics
 
 The Dynamo Operator stores versioned worker hashes on each `DynamoGraphDeployment` (DGD). These
 hashes drive managed worker rollouts and form the suffix of generated worker

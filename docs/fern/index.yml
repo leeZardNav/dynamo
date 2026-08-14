@@ -856,8 +856,6 @@ navigation:
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/autoscaling.md
                   - page: Rolling Update
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/rolling-update.md
-                  - page: Worker Hash Semantics
-                    path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/worker-hash-semantics.md
                   - page: Snapshot
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/snapshot.md
                   - page: Shadow Engine Failover
