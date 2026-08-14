@@ -15,10 +15,11 @@ use local_ip_address::{Error as LocalIpError, list_afinet_netifas, local_ip, loc
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{mpsc, oneshot},
     time::Instant,
 };
+use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
 use super::{CallHomeHandshake, TcpStreamConnectionInfo};
@@ -35,6 +36,8 @@ use crate::{
 };
 
 const TOMBSTONE_TTL: Duration = Duration::from_secs(5);
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 pub trait IpResolver {
     fn local_ip(&self) -> Result<IpAddr, LocalIpError>;
@@ -132,11 +135,18 @@ impl TcpStreamServer {
         };
 
         let state = Arc::new(Mutex::new(State::default()));
-        let local_address = start_listener(SocketAddr::new(ip, options.port), state.clone())
-            .await
-            .map_err(|error| {
-                PipelineError::Generic(format!("Failed to start TCP callback listener: {error}"))
-            })?;
+        let tls_acceptor = build_tls_acceptor().map_err(|error| {
+            PipelineError::Generic(format!("Failed to build TCP TLS acceptor: {error}"))
+        })?;
+        let local_address = start_listener(
+            SocketAddr::new(ip, options.port),
+            state.clone(),
+            tls_acceptor,
+        )
+        .await
+        .map_err(|error| {
+            PipelineError::Generic(format!("Failed to start TCP callback listener: {error}"))
+        })?;
         Ok(Arc::new(Self {
             local_address,
             state,
@@ -245,7 +255,41 @@ fn take_request(state: &Mutex<State>, subject: &str) -> Option<RequestedSendConn
     pending
 }
 
-async fn start_listener(address: SocketAddr, state: Arc<Mutex<State>>) -> Result<SocketAddr> {
+fn build_tls_acceptor() -> Result<Option<Arc<TlsAcceptor>>> {
+    use crate::config::environment_names::tcp_response_stream::tls as env;
+    let cert_path = std::env::var(env::DYN_TCP_TLS_CERT_PATH).ok();
+    let key_path = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            let server_config = crate::tls_utils::server_tls_config(cert.as_ref(), key.as_ref())?;
+            tracing::info!("TCP server: TLS enabled");
+            Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(server_config)))))
+        }
+        (None, None) => {
+            let client_tls_set = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).is_ok()
+                || crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
+            if client_tls_set {
+                tracing::warn!(
+                    "TCP server is running in plaintext mode but client TLS env vars are set. Set {} and {} to enable server-side TLS, or unset client TLS vars.",
+                    env::DYN_TCP_TLS_CERT_PATH,
+                    env::DYN_TCP_TLS_KEY_PATH,
+                );
+            }
+            Ok(None)
+        }
+        _ => anyhow::bail!(
+            "Both {} and {} must be set to enable TCP TLS",
+            env::DYN_TCP_TLS_CERT_PATH,
+            env::DYN_TCP_TLS_KEY_PATH,
+        ),
+    }
+}
+
+async fn start_listener(
+    address: SocketAddr,
+    state: Arc<Mutex<State>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
+) -> Result<SocketAddr> {
     let (ready_tx, ready_rx) = oneshot::channel();
     let listener_state = state.clone();
     let task = tokio::spawn(async move {
@@ -262,8 +306,31 @@ async fn start_listener(address: SocketAddr, state: Arc<Mutex<State>>) -> Result
             let (stream, peer) = listener.accept().await?;
             stream.set_nodelay(true)?;
             let state = listener_state.clone();
+            let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(error) = process_stream(stream, state).await {
+                let halves: Result<(BoxRead, BoxWrite)> = if let Some(tls) = tls_acceptor {
+                    match tokio::time::timeout(
+                        crate::tls_utils::handshake_timeout(),
+                        tls.accept(stream),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => {
+                            let (read, write) = tokio::io::split(stream);
+                            Ok((Box::new(read), Box::new(write)))
+                        }
+                        Ok(Err(error)) => Err(anyhow!("TLS handshake failed: {error}")),
+                        Err(_) => Err(anyhow!("TLS handshake timed out")),
+                    }
+                } else {
+                    let (read, write) = tokio::io::split(stream);
+                    Ok((Box::new(read), Box::new(write)))
+                };
+                let result = match halves {
+                    Ok((read, write)) => process_stream(read, write, state).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
                     tracing::warn!(%peer, %error, "TCP request callback failed");
                 }
             });
@@ -275,8 +342,11 @@ async fn start_listener(address: SocketAddr, state: Arc<Mutex<State>>) -> Result
         .context("TCP callback listener exited before ready")?
 }
 
-async fn process_stream(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> Result<()> {
-    let (read_half, write_half) = tokio::io::split(stream);
+async fn process_stream(
+    read_half: BoxRead,
+    write_half: BoxWrite,
+    state: Arc<Mutex<State>>,
+) -> Result<()> {
     let mut reader = FramedRead::new(read_half, TwoPartCodec::default());
     let writer = FramedWrite::new(write_half, TwoPartCodec::default());
     let first = reader
@@ -306,7 +376,7 @@ async fn process_stream(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>)
 }
 
 async fn send_requests(
-    mut writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
+    mut writer: FramedWrite<BoxWrite, TwoPartCodec>,
     mut request_rx: mpsc::Receiver<TwoPartMessage>,
     context: Arc<dyn AsyncEngineContext>,
 ) {
@@ -342,6 +412,54 @@ async fn send_requests(
 mod tests {
     use super::*;
     use crate::{engine::AsyncEngineContextProvider, pipeline::Context};
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn tcp_tls_acceptor_supports_plaintext_valid_and_rejects_partial_config() {
+        temp_env::with_vars_unset(["DYN_TCP_TLS_CERT_PATH", "DYN_TCP_TLS_KEY_PATH"], || {
+            assert!(build_tls_acceptor().unwrap().is_none());
+        });
+        let (cert, key) = make_cert_files();
+        let cert_path = cert.path().to_str().unwrap();
+        let key_path = key.path().to_str().unwrap();
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", Some(cert_path)),
+                ("DYN_TCP_TLS_KEY_PATH", None),
+            ],
+            || assert!(build_tls_acceptor().is_err()),
+        );
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", None),
+                ("DYN_TCP_TLS_KEY_PATH", Some(key_path)),
+            ],
+            || assert!(build_tls_acceptor().is_err()),
+        );
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", Some(cert_path)),
+                ("DYN_TCP_TLS_KEY_PATH", Some(key_path)),
+            ],
+            || assert!(build_tls_acceptor().unwrap().is_some()),
+        );
+    }
 
     struct FailingResolver;
 
