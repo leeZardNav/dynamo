@@ -28,6 +28,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -88,6 +89,55 @@ func roundTripFromV1alpha1(t *testing.T, src *DynamoGraphDeployment) *DynamoGrap
 		t.Fatalf("ConvertFrom: %v", err)
 	}
 	return out
+}
+
+func TestDGDProviderOverrideRoundTrip(t *testing.T) {
+	t.Log("Build a hub DGD with root, component, leader, and worker overrides")
+	src := &v1beta1.DynamoGraphDeployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "provider-overrides", Namespace: "default"},
+		Spec: v1beta1.DynamoGraphDeploymentSpec{
+			ProviderOverride: providerOverrideForConversion(
+				"PodCliqueSet",
+				`{"spec":{"template":{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"rack"},"futureField":{"enabled":true}}}}}`,
+			),
+			Components: []v1beta1.DynamoComponentDeploymentSharedSpec{
+				{
+					ComponentName: "worker",
+					ProviderOverride: providerOverrideForConversion(
+						"PodCliqueScalingGroupConfig",
+						`{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"rack"}}}`,
+					),
+					Multinode: &v1beta1.MultinodeSpec{
+						NodeCount: 2,
+						Leader: &v1beta1.MultinodeRoleSpec{ProviderOverride: providerOverrideForConversion(
+							"PodCliqueTemplateSpec",
+							`{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"host"}}}`,
+						)},
+						Worker: &v1beta1.MultinodeRoleSpec{ProviderOverride: providerOverrideForConversion(
+							"PodCliqueTemplateSpec",
+							`{"topologyConstraint":{"topologyName":"cluster","pack":{"required":"host"},"newProviderField":"preserved"}}`,
+						)},
+					},
+				},
+			},
+		},
+	}
+
+	t.Log("Round-trip the provider fragments through v1alpha1")
+	got := roundTripFromV1beta1(t, src)
+
+	t.Log("Verify schema identity and opaque provider fields are preserved")
+	if diff := cmp.Diff(src, got, cmpopts.EquateEmpty()); diff != "" {
+		t.Fatalf("provider override round-trip mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func providerOverrideForConversion(target, value string) *v1beta1.ProviderOverride {
+	return &v1beta1.ProviderOverride{
+		APIVersion: "grove.io/v1alpha1",
+		Target:     target,
+		Value:      apiextensionsv1.JSON{Raw: []byte(value)},
+	}
 }
 
 func assertOnlyKnownDGDAnnotations(t *testing.T, annotations map[string]string) {

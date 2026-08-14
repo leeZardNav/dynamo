@@ -241,7 +241,13 @@ func TestValidateDynamoComponentDeploymentSharedSpecFieldPaths(t *testing.T) {
 	}
 	validation := &sharedValidation{ctx: context.Background(), mgr: newGroveTopologyTestManager(t)}
 
-	errs := validation.validateDynamoComponentDeploymentSharedSpec(spec, field.NewPath("spec", "components").Index(0), false, true)
+	errs := validation.validateDynamoComponentDeploymentSharedSpec(
+		spec,
+		field.NewPath("spec", "components").Index(0),
+		dynamoComponentDeploymentSharedSpecValidationOptions{
+			validateInferencePoolAvailability: true,
+		},
+	)
 	assertFieldPaths(t, errs, []string{
 		"spec.components[0].minAvailable",
 		"spec.components[0].sharedMemorySize",
@@ -260,7 +266,14 @@ func TestValidateDynamoComponentDeploymentSharedSpecFrontendSidecar(t *testing.T
 	t.Run("requires pod template", func(t *testing.T) {
 		name := "frontend"
 		spec := &nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{RuntimeVersionOverride: "1.1.0", FrontendSidecar: &name}
-		errs := validation.validateDynamoComponentDeploymentSharedSpec(spec, componentPath, true, true)
+		errs := validation.validateDynamoComponentDeploymentSharedSpec(
+			spec,
+			componentPath,
+			dynamoComponentDeploymentSharedSpecValidationOptions{
+				grovePathway:                      true,
+				validateInferencePoolAvailability: true,
+			},
+		)
 		assertFieldPaths(t, errs, []string{
 			"spec.components[0].podTemplate.spec.containers",
 			"spec.components[0].podTemplate.spec.containers",
@@ -274,7 +287,14 @@ func TestValidateDynamoComponentDeploymentSharedSpecFrontendSidecar(t *testing.T
 			FrontendSidecar:        &name,
 			RuntimeVersionOverride: "1.1.0",
 		}
-		errs := validation.validateDynamoComponentDeploymentSharedSpec(spec, componentPath, true, true)
+		errs := validation.validateDynamoComponentDeploymentSharedSpec(
+			spec,
+			componentPath,
+			dynamoComponentDeploymentSharedSpecValidationOptions{
+				grovePathway:                      true,
+				validateInferencePoolAvailability: true,
+			},
+		)
 		assertFieldPaths(t, errs, []string{
 			"spec.components[0].frontendSidecar",
 		})
@@ -289,7 +309,14 @@ func TestValidateDynamoComponentDeploymentSharedSpecFrontendSidecar(t *testing.T
 			FrontendSidecar:        &name,
 			RuntimeVersionOverride: "1.1.0",
 		}
-		errs := validation.validateDynamoComponentDeploymentSharedSpec(spec, componentPath, true, true)
+		errs := validation.validateDynamoComponentDeploymentSharedSpec(
+			spec,
+			componentPath,
+			dynamoComponentDeploymentSharedSpecValidationOptions{
+				grovePathway:                      true,
+				validateInferencePoolAvailability: true,
+			},
+		)
 		assertFieldPaths(t, errs, nil)
 	})
 }

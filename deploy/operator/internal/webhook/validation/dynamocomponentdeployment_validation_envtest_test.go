@@ -25,6 +25,7 @@ import (
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/provideroverride"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,6 +70,39 @@ func TestDynamoComponentDeploymentValidator_Validate(t *testing.T) {
 				dcd.Spec.Replicas = &validReplicas
 				dcd.Spec.BackendFramework = dcdAdmissionSGLangBackend
 			}),
+		},
+		{
+			name: "standalone DCD rejects provider overrides",
+			deployment: betaDCDForAdmission(func(dcd *nvidiacomv1beta1.DynamoComponentDeployment) {
+				dcd.Spec.ProviderOverride = groveProviderOverride(
+					provideroverride.TargetPodCliqueTemplateSpec,
+					`{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"rack"}}}`,
+				)
+			}),
+			wantWebhookErrs: []string{`spec.providerOverride: Forbidden: provider overrides are supported only for components embedded in a DynamoGraphDeployment`},
+		},
+		{
+			name: "v1alpha1 standalone DCD rejects provider overrides",
+			deployment: alphaDCDForAdmission(func(dcd *nvidiacomv1alpha1.DynamoComponentDeployment) {
+				dcd.Spec.ProviderOverride = alphaGroveProviderOverride(
+					provideroverride.TargetPodCliqueTemplateSpec,
+					`{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"rack"}}}`,
+				)
+			}),
+			wantWebhookErrs: []string{`spec.providerOverride: Forbidden: provider overrides are supported only for components embedded in a DynamoGraphDeployment`},
+		},
+		{
+			name: "standalone DCD rejects multinode role provider overrides",
+			deployment: betaDCDForAdmission(func(dcd *nvidiacomv1beta1.DynamoComponentDeployment) {
+				dcd.Spec.Multinode = &nvidiacomv1beta1.MultinodeSpec{
+					NodeCount: 2,
+					Leader: &nvidiacomv1beta1.MultinodeRoleSpec{ProviderOverride: groveProviderOverride(
+						provideroverride.TargetPodCliqueTemplateSpec,
+						`{"topologyConstraint":{"topologyName":"grove-topology","pack":{"required":"host"}}}`,
+					)},
+				}
+			}),
+			wantWebhookErrs: []string{`spec.multinode.leader.providerOverride: Forbidden: provider overrides are supported only for components embedded in a DynamoGraphDeployment`},
 		},
 		{
 			name: "v1beta1 main image is required when pod template is absent on create",

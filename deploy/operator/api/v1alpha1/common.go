@@ -22,8 +22,32 @@ import (
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+// ProviderOverride carries a sparse provider-native configuration fragment for
+// the DGD provider context in which it appears. Target is resolved and persisted
+// by DGD admission.
+type ProviderOverride struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	APIVersion string `json:"apiVersion"`
+
+	// +optional
+	Target string `json:"target,omitempty"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	Value apiextensionsv1.JSON `json:"value"`
+}
+
+// MultinodeRoleSpec configures one explicit role of a multinode component.
+type MultinodeRoleSpec struct {
+	// +optional
+	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
+}
 
 // +kubebuilder:validation:XValidation:rule="!has(self.create) || self.create == false || (has(self.size) && has(self.storageClass) && has(self.volumeAccessMode))",message="When create is true, size, storageClass, and volumeAccessMode are required"
 type PVC struct {

@@ -19,6 +19,7 @@ package v1beta1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apixv1alpha1 "sigs.k8s.io/gateway-api-inference-extension/apix/config/v1alpha1"
 )
@@ -68,6 +69,40 @@ type CompilationCacheConfig struct {
 	MountPath string `json:"mountPath,omitempty"`
 }
 
+// ProviderOverride carries a sparse, provider-native configuration fragment for
+// the provider context in which it appears. Dynamo resolves Target from the
+// graph-level workload provider and the DGD location, then persists it so the
+// fragment is not reinterpreted after an operator upgrade.
+type ProviderOverride struct {
+	// apiVersion selects the provider schema used to validate value.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	APIVersion string `json:"apiVersion"`
+
+	// target identifies the provider resource kind or embedded provider schema.
+	// It may be omitted on input when the DGD location has one unambiguous target;
+	// admission resolves and persists it.
+	// +optional
+	Target string `json:"target,omitempty"`
+
+	// value is a sparse fragment of the selected provider schema. Admission
+	// restricts it to fields owned by the provider adapter for this context.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	Value apiextensionsv1.JSON `json:"value"`
+}
+
+// MultinodeRoleSpec configures one explicit role of a multinode component.
+// Additional role-specific settings can be added here without introducing a
+// polymorphic list keyed by generated provider resource names.
+type MultinodeRoleSpec struct {
+	// providerOverride configures the provider-native unit generated for this
+	// multinode role. It is supported only for components embedded in a DGD.
+	// +optional
+	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
+}
+
 // MultinodeSpec configures a multinode component.
 type MultinodeSpec struct {
 	// nodeCount is the number of nodes to deploy for the multinode component.
@@ -76,6 +111,14 @@ type MultinodeSpec struct {
 	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=2
 	NodeCount int32 `json:"nodeCount"`
+
+	// leader configures the generated multinode leader unit.
+	// +optional
+	Leader *MultinodeRoleSpec `json:"leader,omitempty"`
+
+	// worker configures the generated multinode worker unit.
+	// +optional
+	Worker *MultinodeRoleSpec `json:"worker,omitempty"`
 }
 
 // ModelReference identifies a model served by a component.

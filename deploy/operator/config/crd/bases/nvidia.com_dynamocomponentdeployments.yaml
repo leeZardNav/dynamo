@@ -11204,6 +11204,28 @@ spec:
                 multinode:
                   description: Multinode is the configuration for multinode components.
                   properties:
+                    leader:
+                      description: Leader configures the generated multinode leader unit.
+                      properties:
+                        providerOverride:
+                          description: |-
+                            ProviderOverride carries a sparse provider-native configuration fragment for
+                            the DGD provider context in which it appears. Target is resolved and persisted
+                            by DGD admission.
+                          properties:
+                            apiVersion:
+                              minLength: 1
+                              type: string
+                            target:
+                              type: string
+                            value:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                            - apiVersion
+                            - value
+                          type: object
+                      type: object
                     nodeCount:
                       default: 2
                       description: |-
@@ -11213,8 +11235,47 @@ spec:
                       format: int32
                       minimum: 2
                       type: integer
+                    worker:
+                      description: Worker configures the generated multinode worker unit.
+                      properties:
+                        providerOverride:
+                          description: |-
+                            ProviderOverride carries a sparse provider-native configuration fragment for
+                            the DGD provider context in which it appears. Target is resolved and persisted
+                            by DGD admission.
+                          properties:
+                            apiVersion:
+                              minLength: 1
+                              type: string
+                            target:
+                              type: string
+                            value:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                            - apiVersion
+                            - value
+                          type: object
+                      type: object
                   required:
                     - nodeCount
+                  type: object
+                providerOverride:
+                  description: |-
+                    ProviderOverride configures the primary provider-native unit representing
+                    this component when it is embedded in a DGD. Standalone DCDs reject it.
+                  properties:
+                    apiVersion:
+                      minLength: 1
+                      type: string
+                    target:
+                      type: string
+                    value:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                    - apiVersion
+                    - value
                   type: object
                 readinessProbe:
                   description: ReadinessProbe to signal when the container is ready to receive traffic.
@@ -12264,6 +12325,35 @@ spec:
                 multinode:
                   description: multinode configures multinode components.
                   properties:
+                    leader:
+                      description: leader configures the generated multinode leader unit.
+                      properties:
+                        providerOverride:
+                          description: |-
+                            providerOverride configures the provider-native unit generated for this
+                            multinode role. It is supported only for components embedded in a DGD.
+                          properties:
+                            apiVersion:
+                              description: apiVersion selects the provider schema used to validate value.
+                              minLength: 1
+                              type: string
+                            target:
+                              description: |-
+                                target identifies the provider resource kind or embedded provider schema.
+                                It may be omitted on input when the DGD location has one unambiguous target;
+                                admission resolves and persists it.
+                              type: string
+                            value:
+                              description: |-
+                                value is a sparse fragment of the selected provider schema. Admission
+                                restricts it to fields owned by the provider adapter for this context.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                            - apiVersion
+                            - value
+                          type: object
+                      type: object
                     nodeCount:
                       default: 2
                       description: |-
@@ -12272,6 +12362,35 @@ spec:
                       format: int32
                       minimum: 2
                       type: integer
+                    worker:
+                      description: worker configures the generated multinode worker unit.
+                      properties:
+                        providerOverride:
+                          description: |-
+                            providerOverride configures the provider-native unit generated for this
+                            multinode role. It is supported only for components embedded in a DGD.
+                          properties:
+                            apiVersion:
+                              description: apiVersion selects the provider schema used to validate value.
+                              minLength: 1
+                              type: string
+                            target:
+                              description: |-
+                                target identifies the provider resource kind or embedded provider schema.
+                                It may be omitted on input when the DGD location has one unambiguous target;
+                                admission resolves and persists it.
+                              type: string
+                            value:
+                              description: |-
+                                value is a sparse fragment of the selected provider schema. Admission
+                                restricts it to fields owned by the provider adapter for this context.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                          required:
+                            - apiVersion
+                            - value
+                          type: object
+                      type: object
                   type: object
                 name:
                   description: |-
@@ -20424,6 +20543,33 @@ spec:
                       required:
                         - containers
                       type: object
+                  type: object
+                providerOverride:
+                  description: |-
+                    providerOverride configures the primary provider-native unit representing
+                    this component. For a Grove DGD this is the sole PCLQ template for a
+                    single-node component or the parent PCSG config for a multinode component.
+                    Standalone DynamoComponentDeployments reject this field initially.
+                  properties:
+                    apiVersion:
+                      description: apiVersion selects the provider schema used to validate value.
+                      minLength: 1
+                      type: string
+                    target:
+                      description: |-
+                        target identifies the provider resource kind or embedded provider schema.
+                        It may be omitted on input when the DGD location has one unambiguous target;
+                        admission resolves and persists it.
+                      type: string
+                    value:
+                      description: |-
+                        value is a sparse fragment of the selected provider schema. Admission
+                        restricts it to fields owned by the provider adapter for this context.
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                  required:
+                    - apiVersion
+                    - value
                   type: object
                 replicas:
                   description: |-
