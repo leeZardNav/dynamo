@@ -76,6 +76,10 @@ func ApplyGroveOverrides(
 	result.SetAPIVersion(GroveAPIVersion)
 	result.SetKind(TargetPodCliqueSet)
 
+	// Remove server-owned fields that do not belong in an apply configuration.
+	unstructured.RemoveNestedField(result.Object, "status")
+	unstructured.RemoveNestedField(result.Object, "metadata", "creationTimestamp")
+
 	// Apply the root fragment before the more specific component destinations.
 	if err := applyGroveRootOverride(result, dgd.Spec.ProviderOverride); err != nil {
 		return nil, fmt.Errorf("spec.providerOverride: %w", err)
@@ -263,6 +267,7 @@ func patchNamedGroveTemplate(
 	return fmt.Errorf("generated destination %s[%q] was not found", strings.Join(path, "."), name)
 }
 
+// mergeJSONObjects applies one JSON object as a Merge Patch to another; patch must encode a JSON object.
 func mergeJSONObjects(destination map[string]interface{}, patch []byte) (map[string]interface{}, error) {
 	// Encode the rendered destination before applying JSON Merge Patch semantics.
 	destinationJSON, err := json.Marshal(destination)

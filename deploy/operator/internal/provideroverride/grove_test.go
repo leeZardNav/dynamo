@@ -18,6 +18,7 @@
 package provideroverride
 
 import (
+	"strings"
 	"testing"
 
 	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
@@ -91,6 +92,14 @@ func TestApplyGroveOverrides(t *testing.T) {
 		t.Fatalf("GVK = %s %s, want %s %s", got.GetAPIVersion(), got.GetKind(), GroveAPIVersion, TargetPodCliqueSet)
 	}
 
+	t.Log("Verify server-owned fields were excluded from the apply payload")
+	if _, found, err := unstructured.NestedFieldNoCopy(got.Object, "status"); err != nil || found {
+		t.Fatalf("status = (found=%t, err=%v), want absent", found, err)
+	}
+	if _, found, err := unstructured.NestedFieldNoCopy(got.Object, "metadata", "creationTimestamp"); err != nil || found {
+		t.Fatalf("metadata.creationTimestamp = (found=%t, err=%v), want absent", found, err)
+	}
+
 	t.Log("Verify each fragment reached only its resolved destination")
 	assertNestedValue(t, got.Object, true, "spec", "template", "topologyConstraint", "futureProviderField", "enabled")
 	assertNamedNestedValue(t, got.Object, []string{"spec", "template", "cliques"}, "frontend", "host", "topologyConstraint", "pack", "required")
@@ -126,9 +135,13 @@ func TestApplyGroveOverridesRejectsMissingDestination(t *testing.T) {
 		},
 	}
 
-	t.Log("Reject the override instead of silently dropping it")
-	if _, err := ApplyGroveOverrides(dgd, desired); err == nil {
+	t.Log("Reject the override with the missing generated destination in the error")
+	_, err := ApplyGroveOverrides(dgd, desired)
+	if err == nil {
 		t.Fatal("ApplyGroveOverrides() error = nil, want missing generated destination error")
+	}
+	if !strings.Contains(err.Error(), `generated destination spec.template.cliques["missing"] was not found`) {
+		t.Fatalf("ApplyGroveOverrides() error = %v, want missing generated destination error", err)
 	}
 }
 
