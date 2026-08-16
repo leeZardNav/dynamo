@@ -335,9 +335,9 @@ def update_engine_config_with_dynamo(
     if fpm_enabled:
         existing_cls = getattr(engine_config, "scheduler_cls", None)
         if existing_cls is None:
-            defaults[
-                "scheduler_cls"
-            ] = "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+            defaults["scheduler_cls"] = (
+                "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+            )
             logger.info(
                 "Forward pass metrics enabled: scheduler_cls set to InstrumentedScheduler "
                 f"(port={envs.DYN_FORWARDPASS_METRIC_PORT})"
@@ -363,9 +363,9 @@ def update_engine_config_with_dynamo(
             )
         existing_cls = getattr(engine_config, "scheduler_cls", None)
         if existing_cls is None and not fpm_enabled:
-            defaults[
-                "scheduler_cls"
-            ] = "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+            defaults["scheduler_cls"] = (
+                "dynamo.vllm.instrumented_scheduler.InstrumentedScheduler"
+            )
             logger.info("Benchmark mode: auto-enabling InstrumentedScheduler")
         elif existing_cls is not None and "InstrumentedScheduler" not in str(
             existing_cls
@@ -389,7 +389,13 @@ def update_engine_config_with_dynamo(
         }
         explicit_points = dynamo_config._benchmark_points
         if explicit_points is not None:
-            benchmark_config["points"] = explicit_points.model_dump(mode="json")
+            # exclude_none so a v1 manifest round-trips as itself: the v3
+            # optional fields (partition, rows) would otherwise be dumped as
+            # nulls the operator never wrote, into a config the scheduler
+            # re-parses and a test compares against the file it read.
+            benchmark_config["points"] = explicit_points.model_dump(
+                mode="json", exclude_none=True
+            )
         else:
             benchmark_config.update(
                 {
