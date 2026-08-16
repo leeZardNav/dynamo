@@ -6,12 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Awaitable, Mapping, Optional, Protocol, TypeVar
 
 from dynamo.workflow.nixl import NixlTensorFanout, NixlTensorRef
+from dynamo.workflow.perf import WORKFLOW_PERF_TRACE
 from dynamo.workflow.plan import INLINE_VALUE_TYPES
 from dynamo.workflow.runtime import (
     StageContext,
@@ -32,6 +35,8 @@ STAGE_RESPONSE_SCHEMA = "dynamo.workflow.stage_response"
 STAGE_WIRE_VERSION = 2
 
 _T = TypeVar("_T")
+
+logger = logging.getLogger(__name__)
 
 
 def _check_keys(data: Mapping[str, Any], required: set[str]) -> None:
@@ -304,6 +309,7 @@ class RemoteStageClient:
         context: StageContext,
         output_transfers: Mapping[str, tuple[str, ...]],
     ) -> Mapping[str, Any]:
+        started_ns = time.perf_counter_ns()
         context.raise_if_cancelled()
         request = StageRequestEnvelope(
             workflow_name=context.workflow_name,
@@ -356,6 +362,13 @@ class RemoteStageClient:
             raise WorkflowExecutionError(
                 f"remote stage {stage_id!r} response identity does not match request"
             )
+        WORKFLOW_PERF_TRACE.emit(
+            logger,
+            "workflow.remote_call",
+            context.attempt_id,
+            elapsed_ms=(time.perf_counter_ns() - started_ns) / 1_000_000,
+            stage=stage_id,
+        )
         return envelope.outputs
 
 
@@ -430,6 +443,7 @@ class RemoteStageServer:
         )
 
         async def invoke() -> dict[str, Any]:
+            started_ns = time.perf_counter_ns()
             expected_inputs = set(self._runner.contract.inputs)
             actual_inputs = set(envelope.inputs)
             if actual_inputs != expected_inputs:
@@ -457,6 +471,7 @@ class RemoteStageServer:
                     runner_inputs[name],
                     f"remote stage {self._stage_id!r} input {name!r}",
                 )
+            inputs_ready_ns = time.perf_counter_ns()
 
             unknown_transfer_outputs = set(envelope.output_transfers) - set(
                 self._runner.contract.outputs
@@ -468,6 +483,7 @@ class RemoteStageServer:
                 )
 
             result = await self._runner.run(MappingProxyType(runner_inputs), context)
+            runner_finished_ns = time.perf_counter_ns()
             if not isinstance(result, Mapping):
                 raise WorkflowExecutionError(
                     f"remote stage {self._stage_id!r} returned a non-mapping result"
@@ -520,6 +536,16 @@ class RemoteStageServer:
                 for transfer_id, reference in references.items():
                     transfers[transfer_id] = NixlTensorRef.from_dict(reference)
                 wire_outputs[name] = NixlTensorFanout(transfers).to_dict()
+            WORKFLOW_PERF_TRACE.emit(
+                logger,
+                "workflow.remote_server",
+                envelope.attempt_id,
+                elapsed_ms=(time.perf_counter_ns() - started_ns) / 1_000_000,
+                export_ms=(time.perf_counter_ns() - runner_finished_ns) / 1_000_000,
+                import_ms=(inputs_ready_ns - started_ns) / 1_000_000,
+                runner_ms=(runner_finished_ns - inputs_ready_ns) / 1_000_000,
+                stage=self._stage_id,
+            )
             return wire_outputs
 
         wire_outputs = await _run_with_stage_lifecycle(
