@@ -24,6 +24,10 @@ _INITIAL_MODEL_LOAD_TARGET = (
 _INIT_ALL_CUDA_GRAPHS_TARGET = (
     "sglang.srt.managers.scheduler.Scheduler.init_all_cuda_graphs"
 )
+_RELEASE_MEMORY_OCCUPATION_TARGET = (
+    "sglang.srt.managers.scheduler_components.weight_updater."
+    "SchedulerWeightUpdaterManager.release_memory_occupation"
+)
 
 
 class GMSV1MemorySaverAdapter(TorchMemorySaverAdapter):
@@ -99,6 +103,11 @@ def _before_init_all_cuda_graphs(_scheduler: object) -> None:
     _adapter()._publish_weights()
 
 
+def _after_release_memory_occupation(result, manager, *args, **kwargs):
+    torch.distributed.barrier(group=manager.tp_cpu_group)
+    return result
+
+
 def register_gms_v1_plugin() -> None:
     """Register the GMS hooks in SGLang processes where Dynamo enabled them."""
     if os.environ.get("DYN_SGL_ENABLE_GMS_V1") != "true":
@@ -117,4 +126,9 @@ def register_gms_v1_plugin() -> None:
         _FACTORY_TARGET,
         _around_adapter_factory,
         HookType.AROUND,
+    )
+    HookRegistry.register(
+        _RELEASE_MEMORY_OCCUPATION_TARGET,
+        _after_release_memory_occupation,
+        HookType.AFTER,
     )
